@@ -31,6 +31,7 @@
       "mem_total": 0,
       "mem_used": 8192,
       "power": 130,
+      "telemetry": null,
       "temp": 66,
       "util": 42
     },
@@ -82,9 +83,9 @@
   },
   "update": {
     "available": false,
-    "current": "0.26.0",
+    "current": "<VERSION>",
     "self_update_enabled": true
   },
   "updated": 1735689600,
-  "version": "0.26.0"
+  "version": "<VERSION>"
 }

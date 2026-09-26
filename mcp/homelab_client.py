@@ -284,6 +284,24 @@ def get_events(range="6h"):
     }
 
 
+def get_uptime(range="24h"):
+    """Uptime checks and maintenance windows over `range`.
+
+    The monitor keeps the current check state and maintenance windows in separate
+    endpoints; combine them so an agent can tell whether a down check was silenced.
+    """
+    data = _get("/api/uptime?range=" + urllib.parse.quote(str(range)))
+    try:
+        maintenance = _get("/api/maintenance") or []
+    except MonitorError:
+        maintenance = []
+    return {
+        "range": data["range"],
+        "checks": data.get("checks") or [],
+        "maintenance": maintenance,
+    }
+
+
 # Alias kept because the issue lists both names; alerts == edge-triggered events.
 def get_alerts(range="6h"):
     """Alias for get_events — the monitor's alerts *are* its edge-triggered events."""
@@ -357,10 +375,14 @@ def get_history(range="6h"):
 
 # ── costs & experiments (the AI Lab Cockpit, over MCP) ───────────────────────
 
-def get_costs(range="7d"):
-    """Power-cost summary for the hub (the Costs tab): what the machine drew and
-    what it cost over `range`, plus the ranked list of which processes, containers,
+def get_costs(range="7d", host=""):
+    """Power-cost summary (the Costs tab): what the machine drew and what it
+    cost over `range`, plus the ranked list of which processes, containers,
     services and models cost the most.
+
+    Pass `host` (a registered host's name) to price a remote machine instead of
+    the hub — integrated over that host's own poll history. Remote hosts have
+    no per-process breakdown yet, so `breakdown` is [] there.
 
     Returns `currency` and `tariff` (flat, or a day/night split), the `machine`
     totals (`now_w` live draw, `energy_kwh`, and `cost` windows for today/7d/30d
@@ -370,7 +392,10 @@ def get_costs(range="7d"):
     cost reads 0). Answers "what did my homelab cost, and what's the biggest line
     item?". The per-bucket stacked-area chart is omitted to keep this compact.
     """
-    d = _get("/api/costs?range=" + urllib.parse.quote(str(range)))
+    q = "/api/costs?range=" + urllib.parse.quote(str(range))
+    if host:
+        q += "&host=" + urllib.parse.quote(str(host))
+    d = _get(q)
     machines = d.get("machines") or []
     m = machines[0] if machines else {}
     return {

@@ -24,7 +24,9 @@ docker compose up -d
 
 Open `http://<your-host>:9800` and you're done. Full options (from source, GPU toolkit, Windows/WSL2) → [**Install docs**](https://sikamikanikobg.github.io/homelab-monitor/install/).
 
-> 🆕 **v0.26 — the LLM Benchmark Lab.** A new AI tab that measures what your local models *actually* do on your GPUs: generation & prompt tokens/sec, load time, the VRAM↔RAM split, and the largest context that still fits fully in VRAM — per card, priced like everything else in the app, stored so you only re-run when something changes. [Release notes](https://github.com/SikamikanikoBG/homelab-monitor/releases) · [changelog](CHANGELOG.md).
+<!-- Deliberately not pinned to a version number: this line used to name a
+     specific release and was three releases out of date within two months. -->
+> 🆕 **What's new** — every release is written up in full, with the reasoning behind it: [latest release](https://github.com/SikamikanikoBG/homelab-monitor/releases/latest) · [changelog](CHANGELOG.md). The dashboard also shows you the notes once, in-app, after it updates itself.
 
 ## What you get
 
@@ -32,9 +34,11 @@ Open `http://<your-host>:9800` and you're done. Full options (from source, GPU t
 
 One page, every box, the questions you actually have. The classics are all here — and a whole **AI cockpit** builds on top of them.
 
-**Your GPU, demystified — and honest about it.** A card pinned at "100% util" can still be throttling, memory-bandwidth-bound, or quietly drooping its clocks. The GPU tab decodes `nvidia-smi`'s throttle reasons (a red banner the moment it's power-capped or too hot), and shows memory-bandwidth util, core/mem clocks, power-vs-limit and p-state — plus *which container is holding the card*. And it's no longer NVIDIA-only: **AMD** GPUs are read on Linux straight from the kernel's `amdgpu` interface (no ROCm), and **AMD and Intel** GPUs on Windows hosts — so your card shows up with its name, utilisation and VRAM, no vendor tools required.
+**A front page for your lab — and a wall screen.** The Overview opens with a **Launchpad**: the apps you actually open, as tiles with their real logos, pinned straight from a container row with the address already filled in, grouped and dragged into the order you want. Pins live on the hub, not in one browser — pin it on the laptop and it's there on the phone and on the wall. The whole board **fits the screen**: it measures its own overrun after every paint and gives ground in order — trimming lists, tightening the fleet rail, folding pins behind a **+N more** — rather than clipping a card in half or running past the fold. Verified from 4K down to 1366×768. And **⛶ Display** (or `/?display=1`, all a dedicated kiosk box needs) drops every scrap of chrome and fills the monitor: you choose which panels the wall shows, and on Chromium-based browsers it opens full-screen on whichever screen you point it at.
 
-![The GPU tab — throttle reasons, memory-bandwidth, clocks and power headroom](docs/screenshots/gpu.png)
+**Your GPU, demystified — and the same tab on every box.** A card pinned at "100% util" can still be throttling, memory-bandwidth-bound, or quietly drooping its clocks. The GPU tab decodes `nvidia-smi`'s throttle reasons, and shows memory-bandwidth util, core/mem clocks, power-vs-limit, p-state — and **fan speed** — for *every* machine in the fleet, not just the one running the container. Multi-GPU boxes get one panel per card on a shared scale per metric, so a taller temperature line really is a hotter card; thermal-throttle windows are shaded right on the sparkline. You can see **which card** a service is sitting on (a 3×3090 box shows a model's 63 GB split 22.5 / 22.1 / 18.8 across the cards, not one pooled number), what each service cost in energy, and get alerted when a card throttles, overheats or loses a fan — sustained, per card, with per-host thresholds, because a box running a deliberately lowered power limit is *supposed* to sit at its cap. And it's no longer NVIDIA-only: **AMD** GPUs are read on Linux straight from the kernel's `amdgpu` interface (no ROCm), and **AMD and Intel** GPUs on Windows hosts — so your card shows up with its name, utilisation and VRAM, no vendor tools required. Anything a driver won't report says so, instead of drawing a confident zero.
+
+![The GPU tab — per-card history, fan speed, temperature and which service is on which card](docs/screenshots/gpu.png)
 
 **What it costs — down to the process.** Power becomes money: per machine, then per component (GPU measured via `nvidia-smi`, CPU/DRAM via RAPL), then **per process, container or model** — click any row to see what it drew and what it cost over any window. Day & night tariffs (Economy 7, Heures Creuses, …), or just pick your country for a sensible estimate. Every watt is measured or a baseline you set; wall power is never guessed. And a **busy-hours heatmap** turns months of samples into one picture of *when* your lab costs you money — a 7×24 day-of-week × hour grid that shows which hour of the week is priciest at a glance.
 
@@ -50,10 +54,11 @@ One page, every box, the questions you actually have. The classics are all here 
 
 And the rest of the lab, the way it always was:
 
-- **Containers, honestly** — health plus **RAM and VRAM in separate columns** (real resident RAM, not page cache), and click one to tail its logs in a side drawer.
+- **Containers, honestly** — health plus **RAM and VRAM in separate columns** (real resident RAM, not page cache), and click one to tail its logs in a side drawer. **Every box in the fleet gets the same controls** — logs, start/stop/restart, restart policy, pin — over the same SSH connection the probe already uses, and the whole tab works on a phone.
 - **systemd services** — local or remote, your own units highlighted, failures first.
-- **WizTree-style disk treemaps**, **network I/O with per-container top talkers**, and a **mini-htop** for who's eating CPU and RAM.
-- **Multi-machine over SSH** — paste one key per box; Linux, a Pi, even **Windows**. No agents, no installs.
+- **WizTree-style disk treemaps — on any box in the fleet.** Click into the folders filling a disk on the hub *or* on any Linux host you've added; a remote is scanned over the same SSH connection everything else uses, so there's still nothing to install on it. Plus **network I/O with per-container top talkers** and a **mini-htop** for who's eating CPU and RAM.
+- **It moves like a live dashboard.** Utilisation, RAM, temperature and power update every couple of seconds over a push stream instead of a fixed poll — and it does that while making *fewer* requests than before, because the expensive history query is fetched only as often as its own chart buckets can change, and a tab you're not looking at stops costing anything at all. Sampling and storage cadence are untouched, so history stays exactly as dense (and costs stay exactly as accurate) as they were.
+- **Multi-machine over SSH** — paste one key per box; Linux, a Pi, even **Windows**. No agents, no installs. The GPU tab works per host too: a remote multi-GPU rig shows **every card's VRAM, utilisation, power and temperature**, and the processes holding the memory.
 - **Uptime monitoring, in the box** — watch any **HTTP endpoint or TCP port** (your services, a NAS, a remote site) straight from the container: heartbeat strip, 24h/7d uptime %, latency, and **smart per-check alerts** — anti-flap confirm, recovery with downtime, and an optional slow-response warning. No extra uptime service to self-host — it's already in the box.
 - **Push alerts** — **Discord**, **ntfy.sh** and **Telegram**, edge-triggered so they don't spam.
 
@@ -61,7 +66,7 @@ Full tab-by-tab tour → [**Features**](https://sikamikanikobg.github.io/homelab
 
 ## Multi-machine, in two sentences
 
-Open the **Hosts** tab, paste the hub's auto-generated SSH key onto each remote, and the hub starts polling it — no agents, just SSH + Python 3 (PowerShell on Windows). The hub pipes a small self-contained probe over SSH; nothing persists on the remote.
+Open the **Hosts** tab, paste the hub's auto-generated SSH key onto each remote, and the hub starts polling it — no agents, just SSH + Python 3 (PowerShell on Windows). The hub pipes a small self-contained probe over SSH; nothing persists on the remote. The same connection is what lets you open a remote's **GPU cockpit** and **scan its disks** from the hub — still with nothing installed on the far end.
 
 Onboarding, Windows setup, and the security model → [**Multi-machine docs**](https://sikamikanikobg.github.io/homelab-monitor/multi-host/).
 
@@ -71,15 +76,23 @@ Set these under `environment:` in `docker-compose.yml` (all optional):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SAMPLE_INTERVAL` | `10` | Seconds between samples |
+| `SAMPLE_INTERVAL` | `10` | Seconds between stored samples. This is the **storage** cadence — every energy and cost figure is integrated against it, so changing it changes how history is priced |
+| `FAST_INTERVAL` | `2` | Seconds between live-value refreshes on screen. Reads only cheap counters and stores nothing, so it costs no history and no accuracy. `0` turns the push stream off and the dashboard falls back to polling |
 | `RETENTION_DAYS` | `180` | How long history is kept |
 | `PRESSURE_FREE_MB` | `2048` | Free VRAM below this counts as "pressure" |
 | `PORT` | `9800` | Dashboard port |
 | `MCP_PORT` | `9810` | Port for the built-in read-only MCP server |
 | `ENABLE_MCP` | `1` | Set `0` to run the dashboard without the MCP server |
+| `ENABLE_CONTROLS` | `1` | Set `0` to remove the start/stop/restart buttons from the Containers and Services tabs |
+| `ALLOW_SELF_UPDATE` | `1` | Set `0` to disable in-app updating |
 | `WATCH_CONTAINERS` | — | Extra containers to scan for OOM (comma-separated) |
 | `WATCH_SERVICES` | — | systemd units to always show, even vendor ones (comma-separated) |
 | `CHECK_UPDATES` | `true` | Set `false` to disable the daily GitHub-releases check (no outbound calls) |
+| `CHECK_OS_UPDATES` | `true` | Set `false` to stop reporting pending OS package updates |
+| `PUBLIC_STATUS` | — | Set to enable the public status page (also a Settings toggle, which needs no restart) |
+| `DB_PATH` | `/data/gpu.db` | Where history is stored inside the container |
+| `HOST_ROOT` | `/rootfs` | Mount point of the read-only host root |
+| `DOCKER_SOCK` | `/var/run/docker.sock` | Docker socket to read containers from |
 
 History lives in `./data/gpu.db` (a bind mount), so it survives restarts and upgrades. Alerts, the systemd D-Bus mount, and per-server tuning → [**Configuration docs**](https://sikamikanikobg.github.io/homelab-monitor/configuration/).
 
@@ -123,11 +136,18 @@ This is a host monitor: it runs with host access, plus a read-write Docker socke
 
 If HomeLab Monitor saves you a browser tab or two, a ⭐ on GitHub genuinely helps other home-labbers find it. Thank you!
 
-<a href="https://www.star-history.com/?repos=SikamikanikoBG%2Fhomelab-monitor&type=date&legend=top-left">
+<!-- Rendered by .github/workflows/star-history.yml from our own stargazer data and
+     committed to the repo — not fetched from star-history.com. GitHub restricted the
+     stargazers API on 2026-06-30 to a repo's own admins and collaborators, so their
+     servers can no longer build this chart for anyone; the embed returned a 200 whose
+     entire content was "GitHub restricted access to star data". Their fix is to embed
+     a token with Contents:read-write in the README, which would give a third party
+     push access to this repo. We render it ourselves instead. -->
+<a href="https://github.com/SikamikanikoBG/homelab-monitor/stargazers">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=SikamikanikoBG/homelab-monitor&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=SikamikanikoBG/homelab-monitor&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=SikamikanikoBG/homelab-monitor&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="docs/star-history-dark.svg" />
+   <source media="(prefers-color-scheme: light)" srcset="docs/star-history-light.svg" />
+   <img alt="Star history — cumulative stars over time" src="docs/star-history-light.svg" width="800" />
  </picture>
 </a>
 
@@ -145,7 +165,7 @@ Issues and PRs are very welcome — especially new model-server probes, new moni
 
 ### Contributors
 
-Thanks to everyone who's filed an issue, opened a PR, or helped shape the roadmap. v0.24.0's `backend/` module-tree refactor came from **[@pehota](https://github.com/pehota)**. v0.23.0's maintenance windows came from **[@1HazyOne707](https://github.com/1HazyOne707)**. See the [changelog](CHANGELOG.md) for the full, ongoing credit trail.
+Thanks to everyone who's filed an issue, opened a PR, or helped shape the roadmap. The entire AMD GPU back-end — per-process VRAM via DRM fdinfo and full panel parity in v0.28.0, real VRAM on unified-memory APUs in v0.26.0 — came from **[@andreahaku](https://github.com/andreahaku)**. v0.27.0's fleet-aware model registry and v0.23.0's maintenance windows came from **[@1HazyOne707](https://github.com/1HazyOne707)**. v0.27.0's RAPL CPU/DRAM power and v0.24.0's `backend/` module-tree refactor came from **[@pehota](https://github.com/pehota)**. See the [changelog](CHANGELOG.md) for the full, ongoing credit trail.
 
 ## License
 

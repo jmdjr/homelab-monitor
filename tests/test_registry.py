@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app
@@ -141,13 +142,18 @@ class TestMergeRegistry(unittest.TestCase):
         self.assertTrue(all(m["provider"] == "ollama" and m["host"] == "local" for m in out))
 
     def test_vllm_catalog_entry_merged_in(self):
-        catalog = [{"service": "vllm-server", "provider": "vllm", "model": "mistral-7b-instruct",
-                    "loaded": True, "vram_mb": 5200}]
+        catalog = [{"host": "gpu-node-01",
+                    "service": "vllm-server",
+                    "provider": "vllm",
+                    "model": "mistral-7b-instruct",
+                    "loaded": True,
+                    "vram_mb": 5200}]
         out = app._merge_registry([], catalog)
         self.assertEqual(len(out), 1)
         m = out[0]
         self.assertEqual(m["name"], "mistral-7b-instruct")
         self.assertEqual(m["provider"], "vllm")
+        self.assertEqual(m["host"], "gpu-node-01")
         self.assertTrue(m["loaded"])
         self.assertEqual(m["vram_mb"], 5200)
         self.assertIsNone(m["size_bytes"])   # vLLM's /v1/models has no on-disk size
@@ -161,9 +167,72 @@ class TestMergeRegistry(unittest.TestCase):
         out = app._merge_registry(ollama, catalog)
         self.assertEqual(len(out), 3)   # still just the 3 ollama disk entries
 
+    def test_remote_ollama_entries_pass_through_with_detail(self):
+        # THE #236 regression: every provider=='ollama' catalog entry was
+        # dropped, which blinded the fleet registry to remote hosts' ollama —
+        # the exact hosts the fleet slice exists for. Remote entries (host set,
+        # not the hub) must survive, with their registry detail carried.
+        catalog = [{"host": "vader", "service": "ollama", "provider": "ollama",
+                    "model": "glm-air:80k", "loaded": True, "vram_mb": 62461,
+                    "size_bytes": 65495378161, "family": "glm4moe",
+                    "param_size": "110.5B", "quant": "Q3_K_M",
+                    "modified": "2026-07-20T10:00:00Z"}]
+        out = app._merge_registry([], catalog)
+        self.assertEqual(len(out), 1)
+        m = out[0]
+        self.assertEqual((m["host"], m["provider"]), ("vader", "ollama"))
+        self.assertTrue(m["loaded"])
+        self.assertEqual(m["vram_mb"], 62461)
+        self.assertEqual(m["param_size"], "110.5B")
+        self.assertEqual(m["size_gb"], round(65495378161 / 1073741824, 2))
+
+    def test_hub_hostname_ollama_entries_deduped_against_disk_registry(self):
+        # The hub's own probe stamps its real hostname — folded to "local" so
+        # it dedupes against the richer disk registry entry for the same model.
+        ollama = app._parse_model_registry(SAMPLE_TAGS, [])
+        with mock.patch.object(app.socket, "gethostname", return_value="hubbox"):
+            out = app._merge_registry(ollama, [{"host": "hubbox", "provider": "ollama",
+                                                "model": "gemma3:1b", "loaded": False}])
+        self.assertEqual(len(out), 3)
+        self.assertTrue(all(m["host"] == "local" for m in out))
+
+    def test_hub_ollama_container_unknown_to_disk_registry_passes_through(self):
+        # The disk registry only ever talks to ONE ollama (COPILOT_OLLAMA_URL).
+        # A second ollama container on the hub — or the only one, on a
+        # non-default port the registry can't reach — used to have every model
+        # dropped from the Installed list while the panel above showed it
+        # loaded. Its models must pass through when the registry doesn't
+        # already list them.
+        catalog = [{"host": "local", "service": "ollama-embed", "provider": "ollama",
+                    "model": "nomic-embed-text:latest", "loaded": True, "vram_mb": 600}]
+        out = app._merge_registry([], catalog)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["name"], "nomic-embed-text:latest")
+        self.assertEqual(out[0]["service"], "ollama-embed")
+        self.assertTrue(out[0]["loaded"])
+        # ...and still dedupes when the disk registry DOES know the model.
+        ollama = app._parse_model_registry(SAMPLE_TAGS, [])
+        dup = [{"host": "local", "service": "ollama", "provider": "ollama",
+                "model": "gemma3:1b", "loaded": False}]
+        self.assertEqual(len(app._merge_registry(ollama, dup)), 3)
+
     def test_catalog_entries_missing_model_name_skipped(self):
         catalog = [{"service": "x", "provider": "vllm", "model": None}]
         self.assertEqual(app._merge_registry([], catalog), [])
+
+    def test_same_model_same_provider_different_hosts_kept(self):
+        catalog = [
+            {"host": "gpu-node-01", "service": "a", "provider": "vllm",
+             "model": "llama3", "loaded": True, "vram_mb": 1000},
+            {"host": "gpu-node-02", "service": "b", "provider": "vllm",
+             "model": "llama3", "loaded": False, "vram_mb": None},
+        ]
+        out = app._merge_registry([], catalog)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(
+            {m["host"] for m in out},
+            {"gpu-node-01", "gpu-node-02"}
+        )
 
     def test_same_name_two_providers_both_kept(self):
         catalog = [{"service": "a", "provider": "vllm", "model": "llama3", "loaded": True, "vram_mb": 1},
@@ -220,6 +289,51 @@ class TestEndpoint(unittest.TestCase):
         self.assertEqual(j["providers"], ["vllm"])
         self.assertEqual(len(j["models"]), 1)
         self.assertEqual(j["models"][0]["provider"], "vllm")
+
+    def test_remote_catalog_is_keyed_by_the_registered_host_name(self):
+        """A remote's probe reports its own socket.gethostname(), which need not
+        match the name the host is registered under. The dashboard filters by the
+        REGISTERED name, so /api/models must speak that name — otherwise the host's
+        models are silently invisible on its own AI Models tab."""
+        app.COPILOT_ENABLED = True
+        app.COPILOT_OLLAMA_URL = "http://127.0.0.1:1"   # dead port — no hub entries
+        with app.HOST_DATA_LOCK:
+            app.HOST_DATA["Work"] = {"data": {"model_catalog": [
+                {"host": "DESKTOP-ABC", "service": "ollama", "provider": "ollama",
+                 "model": "qwen3:8b", "loaded": True, "vram_mb": 5200},
+            ]}}
+        try:
+            j = self.c.get("/api/models").get_json()
+        finally:
+            with app.HOST_DATA_LOCK:
+                app.HOST_DATA.pop("Work", None)
+        self.assertEqual(len(j["models"]), 1)
+        self.assertEqual(j["models"][0]["host"], "Work")          # registered name wins
+        self.assertEqual(j["models"][0]["name"], "qwen3:8b")
+
+    def test_double_nested_remote_catalog_does_not_500(self):
+        """#292: probe.ps1 double-wrapped its model array ([[{...}]]) and
+        /api/models raised on dict(list) for every Windows host with models —
+        the whole AI Models tab sat on a spinner. The probe is fixed; the hub
+        also unwraps defensively so an older probe can never 500 the fleet."""
+        app.COPILOT_ENABLED = True
+        app.COPILOT_OLLAMA_URL = "http://127.0.0.1:1"
+        with app.HOST_DATA_LOCK:
+            app.HOST_DATA["Win"] = {"data": {"model_catalog": [[
+                {"host": "DESKTOP-ABC", "service": "ollama", "provider": "ollama",
+                 "model": "llama3:8b", "loaded": False, "vram_mb": None},
+                {"host": "DESKTOP-ABC", "service": "ollama", "provider": "ollama",
+                 "model": "qwen3:8b", "loaded": True, "vram_mb": 5200},
+            ]]}}
+        try:
+            r = self.c.get("/api/models")
+        finally:
+            with app.HOST_DATA_LOCK:
+                app.HOST_DATA.pop("Win", None)
+        self.assertEqual(r.status_code, 200)
+        j = r.get_json()
+        self.assertEqual(sorted(m["name"] for m in j["models"]), ["llama3:8b", "qwen3:8b"])
+        self.assertTrue(all(m["host"] == "Win" for m in j["models"]))
 
     def test_disabled_returns_enabled_false_empty(self):
         app.COPILOT_ENABLED = False
@@ -279,6 +393,35 @@ class TestCache(unittest.TestCase):
         finally:
             app._fetch_model_registry = real
         self.assertEqual(calls["n"], 2)          # stale → re-fetched
+
+
+class TestResolveFleetHost(unittest.TestCase):
+    """A custom server's fleet_host → the fleet name its models are stamped with.
+    The per-host AI Models tab groups by fleet name, so this is what makes a
+    hub-probed vLLM show up under 'vader' instead of the hub's hostname."""
+    @classmethod
+    def setUpClass(cls):
+        from backend import collectors
+        # A plain module function — call it unbound, `self.resolve(...)` would
+        # hand `self` in as `stored`.
+        cls.resolve = staticmethod(collectors._resolve_fleet_host)
+
+    def test_blank_and_local_are_the_hub(self):
+        for stored in (None, "", "local"):
+            self.assertEqual(self.resolve(stored, {"local", "vader"}), "local")
+
+    def test_known_host_is_itself(self):
+        self.assertEqual(self.resolve("vader", {"local", "vader", "cloudy"}), "vader")
+
+    def test_removed_host_degrades_to_hub(self):
+        # 'vader' was deleted after the server was registered — degrade to the
+        # hub (always visible) rather than vanish into a name no tab has.
+        self.assertEqual(self.resolve("vader", {"local", "cloudy"}), "local")
+
+    def test_case_and_whitespace_are_not_clever(self):
+        # A fleet name is exact-match; we don't normalise, so a typo stays a
+        # "removed" host and degrades to the hub.
+        self.assertEqual(self.resolve("Vader", {"local", "vader"}), "local")
 
 
 if __name__ == "__main__":

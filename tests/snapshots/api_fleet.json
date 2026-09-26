@@ -2,6 +2,7 @@
   "hosts": [
     {
       "at": 1735689600,
+      "gpu_telemetry": null,
       "host": {
         "cpu": 30,
         "hostname": "testhost"
@@ -18,5 +19,6 @@
       "ssh_target": null
     }
   ],
-  "interval": 10
+  "interval": 10,
+  "rev": 0
 }

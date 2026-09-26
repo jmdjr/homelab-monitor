@@ -42,18 +42,41 @@ def api_sessions():
 @bp.route("/api/models")
 def api_models():
     import app as _app
-    """The Model Registry: the full inventory of models available on this host —
-    ollama's on-disk catalogue (GET /api/tags, size/quant/param detail) merged with
-    every other recognised AI server's model list (#219: vLLM, llama.cpp, LM Studio,
-    ComfyUI, InvokeAI, …), cross-referenced with what's loaded right now so the UI
-    can flag resident models + their live VRAM, grouped by provider.
+    """The Model Registry: the full inventory of models available across the
+    fleet -- this host's ollama on-disk catalogue (GET /api/tags, size/quant/param
+    detail) merged with every other recognised AI server's model list on this
+    host (#219: vLLM, llama.cpp, LM Studio, ComfyUI, InvokeAI, ...) PLUS every
+    registered remote host's own catalog (Ollama slice so far -- probe.py polls
+    each remote's ollama the same way, over SSH, no direct network reachability
+    to the remote's port required). Cross-referenced with what's loaded right
+    now so the UI can flag resident models + their live VRAM, grouped by host
+    then provider.
 
     Always 200, graceful-degrade, never 500, no secret leak (we echo a `reachable`
     bool, never the URL/creds). Ollama half cached ~45s so a busy tab can't hammer
-    it; the rest rides the existing sampler's cached model_catalog (no extra I/O).
+    it; the rest rides the existing sampler's cached model_catalog (no extra I/O)
+    plus whatever's already sitting in HOST_DATA from the normal host-poll cycle
+    (also no extra I/O -- this route never triggers a fresh remote poll itself).
     /api/tags is polled outside any held _app.LOCK."""
     ollama_models, reachable = _app._model_registry()
-    models = _app._merge_registry(ollama_models, _app.LATEST.get("model_catalog"))
+    catalog = list(_app.LATEST.get("model_catalog") or [])
+    with _app.HOST_DATA_LOCK:
+        remote_items = list(_app.HOST_DATA.items())
+    for _name, entry in remote_items:
+        remote_catalog = (entry.get("data") or {}).get("model_catalog")
+        if remote_catalog:
+            # Key every remote entry by its REGISTERED fleet name — that is what the
+            # host selector sends and what the UI filters on. The probe's own
+            # socket.gethostname() may differ (registered "Work" vs "DESKTOP-…"),
+            # which silently hid that host's models.
+            for m in remote_catalog:
+                if isinstance(m, dict):
+                    catalog.append(dict(m, host=_name))
+                elif isinstance(m, (list, tuple)):
+                    # An older probe.ps1 double-nested the array ([[...]], #292);
+                    # never let one malformed remote 500 the whole registry.
+                    catalog.extend(dict(x, host=_name) for x in m if isinstance(x, dict))
+    models = _app._merge_registry(ollama_models, catalog)
     return jsonify({
         "enabled": _app.COPILOT_ENABLED,
         "ollama_reachable": reachable,
@@ -61,5 +84,19 @@ def api_models():
         "totals": _app._registry_totals(models),
         "providers": sorted({m["provider"] for m in models}),
     })
+
+
+@bp.route("/api/ai/now")
+def api_ai_now():
+    import app as _app
+    """Light live snapshot for the AI Models tab's fast poll: loaded models with
+    the VRAM/RAM/ctx state (throttled on-demand ollama re-probe, ~3s TTL — see
+    ai_models_now) plus the sampler's latest meta/serving/callers. No DB, no
+    _app.LOCK, so it's safe to poll every few seconds."""
+    models, at = _app.ai_models_now()
+    return jsonify({"ts": _app.LATEST.get("ts"), "probed_at": int(at), "models": models,
+                    "model_meta": _app.LATEST.get("model_meta") or {},
+                    "serving": _app.LATEST.get("serving") or [],
+                    "callers": _app.LATEST.get("callers") or []})
 
 

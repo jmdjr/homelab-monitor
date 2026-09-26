@@ -77,15 +77,32 @@ function Read-Gpu {
                 $p = $lines[0].Split(',') | ForEach-Object { $_.Trim() }
                 if ($p.Count -ge 5) {
                     function I($v) { try { return [int][double]$v } catch { return 0 } }
-                    return @{ gpu = [ordered]@{
-                        count     = $lines.Count
-                        name      = $p[4]
-                        mem_used  = (I $p[0])
-                        mem_total = (I $p[1])
-                        util      = (I $p[2])
-                        temp      = (I $p[3])
-                        vendor    = 'nvidia'
-                    } }
+                    # Per-card list (same shape as probe.py's read_gpu) so the
+                    # System tab's Hardware card can name every card, not just GPU 0.
+                    $gpus = @()
+                    for ($i = 0; $i -lt $lines.Count; $i++) {
+                        $q = $lines[$i].Split(',') | ForEach-Object { $_.Trim() }
+                        if ($q.Count -ge 5) {
+                            $gpus += [ordered]@{
+                                idx = $i
+                                name = $q[4]
+                                mem_total = (I $q[1])
+                                vendor = 'nvidia'
+                            }
+                        }
+                    }
+                    return @{
+                        gpu = [ordered]@{
+                            count     = $lines.Count
+                            name      = $p[4]
+                            mem_used  = (I $p[0])
+                            mem_total = (I $p[1])
+                            util      = (I $p[2])
+                            temp      = (I $p[3])
+                            vendor    = 'nvidia'
+                        }
+                        gpus = $gpus
+                    }
                 }
             }
         }
@@ -409,6 +426,70 @@ function Read-Services {
     } catch { return @{} }
 }
 
+# ── AI models (Windows parity with probe.py's read_ai_models) ─────────────────
+# Ollama on this host: the resident set from /api/ps (live VRAM) cross-referenced
+# with the on-disk catalogue from /api/tags, so a model shows up whether or not it
+# is currently loaded. Row shape matches probe.py exactly — the hub merges local
+# and remote entries through the same code path. Read-only, 2 s timeouts, silent
+# when ollama is not running here.
+function Read-OllamaModels {
+    $api = 'http://127.0.0.1:11434'
+    $host_name = $env:COMPUTERNAME
+
+    # Resident set first: model name -> live VRAM in MB.
+    $loaded = @{}
+    try {
+        $ps = Invoke-RestMethod -Uri "$api/api/ps" -TimeoutSec 2 -ErrorAction Stop
+        foreach ($m in @($ps.models)) {
+            if (-not $m.name) { continue }
+            $vram = $null
+            if ($m.size_vram) { $vram = [int][math]::Round($m.size_vram / 1MB) }
+            $loaded[$m.name] = $vram
+        }
+    } catch { }
+
+    # Full on-disk catalogue with registry detail. Note the real field names:
+    # `name` already carries the tag, params/quant live under `details`, and the
+    # timestamp is `modified_at`.
+    $out = @()
+    $known = @{}
+    try {
+        $tags = Invoke-RestMethod -Uri "$api/api/tags" -TimeoutSec 2 -ErrorAction Stop
+        foreach ($m in @($tags.models)) {
+            if (-not $m.name) { continue }
+            $known[$m.name] = $true
+            $isLoaded = $loaded.ContainsKey($m.name)
+            $out += [ordered]@{
+                host       = $host_name
+                service    = 'ollama'
+                provider   = 'ollama'
+                model      = $m.name
+                loaded     = $isLoaded
+                vram_mb    = $(if ($isLoaded) { $loaded[$m.name] } else { $null })
+                size_bytes = $m.size
+                family     = $m.details.family
+                param_size = $m.details.parameter_size
+                quant      = $m.details.quantization_level
+                modified   = $m.modified_at
+            }
+        }
+    } catch { }
+
+    # A model can be resident without being on disk (deleted while loaded, pulled
+    # through another path) — keep it visible rather than letting it vanish.
+    foreach ($name in $loaded.Keys) {
+        if ($known.ContainsKey($name)) { continue }
+        $out += [ordered]@{
+            host = $host_name; service = 'ollama'; provider = 'ollama'
+            model = $name; loaded = $true; vram_mb = $loaded[$name]
+        }
+    }
+    # No unary comma here: the call site wraps this in @(...) which already
+    # guarantees an array. `return ,$out` + @() double-wrapped it, so a host
+    # with N models shipped [[N dicts]] and /api/models 500ed on the hub (#292).
+    return $out
+}
+
 # ── Assemble + emit ───────────────────────────────────────────────────────────
 # Merge helper-returned hashtables into one host block.
 $merged = @{}
@@ -424,10 +505,12 @@ Merge (Read-Services)
 $merged.disks    = (Read-Disks)
 $merged.hostname = $env:COMPUTERNAME
 
+# Model catalog sits alongside `host`, matching probe.py's payload shape.
 $payload = [ordered]@{
     host          = $merged
+    model_catalog = @(Read-OllamaModels)
     at            = (Epoch (Get-Date))
-    probe_version = 'win-0.1'
+    probe_version = 'win-0.2'
 }
 
 # Single compact JSON line on stdout, nothing else.

@@ -1,3 +1,5 @@
+import logging
+import socket
 """
 backend/collectors — background worker functions extracted from app.py (Phase 3.2).
 
@@ -24,7 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 from backend.db.repos.samples import rollup_now as _rollup_now
 from backend.db.repos.samples import rollup_net_now as _rollup_net_now
 from backend._heartbeat import heartbeat as _heartbeat, get_heartbeats as _get_heartbeats
-from backend.probes import _match_probe, _match_probe_key, probe_models
+from backend.probes import (_match_probe, _match_probe_key, probe_models,
+                            probe_custom_server, parse_custom_servers)
 
 # Re-export so callers can do `from backend.collectors import _HEARTBEATS, _HEARTBEAT_LOCK`
 # (used by tests that import the heartbeat module directly for isolation assertions).
@@ -54,25 +57,44 @@ def watchdog(check_interval: float = 10.0) -> None:  # pragma: no cover
 
 # ── Background workers ───────────────────────────────────────────────────────
 
-def host_poller():
+def host_poller(stop=None):
     import app as _app
     """Loop: probe every registered host whose last Test was healthy. Hosts are
     polled *concurrently* so one slow/timing-out remote can't delay the others and
     age their rows out to a false 'offline' (the flapping bug). A per-host adaptive
     timeout (issue #99) still isolates slow remotes — they self-calibrate to a
     working budget instead of going permanently dark, while fast hosts stay at the
-    15s default. Errors are kept on the cache row so the UI can show a last error."""
+    15s default. Errors are kept on the cache row so the UI can show a last error.
+
+    Every host rides its OWN cadence. The previous shape ran one pool per cycle
+    and waited for the whole cycle to finish before sleeping INTERVAL — so the
+    period of EVERY host was (slowest probe + INTERVAL). A Windows box whose
+    PowerShell probe takes 40 s made a 4 s Linux box refresh every 50 s, and the
+    GPU tab looked like it ignored the refresh interval. Now each tick submits
+    only the hosts that aren't still mid-probe: a fast host is re-polled every
+    INTERVAL, a slow one as soon as its previous probe lands, and neither ever
+    waits on the other. The pool is long-lived so the slow probe keeps running
+    across ticks instead of being joined at the end of each one.
+
+    `stop` (a threading.Event) ends the loop — only tests use it; the app runs
+    this forever on a daemon thread."""
     # Stagger the first run a touch so we don't fire before the app is fully up.
     time.sleep(2)
-    while True:
+    ex = ThreadPoolExecutor(max_workers=8, thread_name_prefix="host-poll")
+    inflight = {}   # host name -> Future of its running probe
+    while not (stop is not None and stop.is_set()):
         _heartbeat("host_poller", _app.INTERVAL)
         try:
             hosts = _app.list_hosts()
-            if hosts:
-                # Each host gets its own thread for the cycle, so the wall-clock
-                # period is the slowest single probe, not the sum of all of them.
-                with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as ex:
-                    list(ex.map(_app._poll_one_host, hosts))
+            names = {h["name"] for h in hosts}
+            for h in hosts:
+                f = inflight.get(h["name"])
+                if f is not None and not f.done():
+                    continue        # still probing from an earlier tick
+                inflight[h["name"]] = ex.submit(_app._poll_one_host, h)
+            # Forget hosts that were removed once their last probe has landed.
+            for n in [n for n in inflight if n not in names and inflight[n].done()]:
+                inflight.pop(n, None)
         except Exception as e:
             print("host_poller error:", e, flush=True)
         time.sleep(_app.INTERVAL)
@@ -98,6 +120,17 @@ def uptime_worker():
 # next failure re-fires exactly once.
 
 
+def _resolve_fleet_host(stored, known_hosts):
+    """A custom server's fleet_host setting → the fleet name its models are
+    stamped with. ""/None/"local" → "local" (the hub). A name that is currently
+    a registered fleet host → itself (so the per-host AI Models tab picks it up).
+    Anything else — a host that was removed after the server was registered —
+    degrades to the hub, where it was always visible, rather than vanishing into
+    a name no tab has. Pure → unit-testable."""
+    if not stored or stored == "local":
+        return "local"
+    return stored if stored in known_hosts else "local"
+
 def sample_once():
     import app as _app
     conts = _app.containers()
@@ -113,9 +146,11 @@ def sample_once():
     gpus = []
     gpu_extra = {}
     procs = {}
+    svc_by_card = {}    # service -> {card idx: MB} — per-card VRAM attribution
     gpu_pids = {}
     gpu_avail = False
     gpu_vendor = None   # "nvidia" | "amd" | "hybrid" — drives the vendor-aware GPU diagnostic
+    gpu_error = None    # nvidia-smi's own first line when an NVIDIA stack is present but broken
     try:
         # One CSV row per card (issue #95). Parse each field defensively: nvidia-_app.smi
         # emits the literal "[N/A]" / "[Not Supported]" for power.draw/temperature
@@ -126,8 +161,17 @@ def sample_once():
         # AMD card on a host without nvidia-smi was never read at all (issue #1).
         nv_gpus = []
         try:
-            rows = _app.smi(["--query-gpu=index,name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
-                        "--format=csv,noheader,nounits"]).splitlines()
+            # fan.speed is asked for in the same pass, but nvidia-smi rejects the
+            # WHOLE query on an unrecognised field name — so a driver too old to
+            # know it falls back to the exact previous 7-field query rather than
+            # reporting no cards at all.
+            base_fields = ("index,name,utilization.gpu,memory.used,memory.total,"
+                           "power.draw,temperature.gpu")
+            rows = _app.smi([f"--query-gpu={base_fields},fan.speed",
+                             "--format=csv,noheader,nounits"]).splitlines()
+            if not any(line.strip() for line in rows):
+                rows = _app.smi([f"--query-gpu={base_fields}",
+                                 "--format=csv,noheader,nounits"]).splitlines()
             for line in rows:
                 if not line.strip():
                     continue
@@ -135,8 +179,15 @@ def sample_once():
                 if len(p) < 7:
                     continue
                 u, mu, mt, pw, tp = (_app._gpu_num(x) for x in p[2:7])
-                nv_gpus.append({"idx": int(_app._gpu_num(p[0])), "name": p[1] or f"GPU {p[0]}",
-                             "util": u, "mem_used": mu, "mem_total": mt, "power": pw, "temp": tp})
+                card = {"idx": int(_app._gpu_num(p[0])), "name": p[1] or f"GPU {p[0]}",
+                        "util": u, "mem_used": mu, "mem_total": mt, "power": pw, "temp": tp}
+                # Absent, not 0: passively-cooled datacentre cards have no fan to
+                # report, and a 0 here would trip the fan-stall alert on hardware
+                # that has no fan to stall.
+                fan = _app._gpu_opt(p[7]) if len(p) > 7 else None
+                if fan is not None:
+                    card["fan"] = round(fan)   # % of max, integral like the probe's
+                nv_gpus.append(card)
         except Exception:
             nv_gpus = []   # no nvidia-smi / wedged driver — an AMD card may still be present
         # AMD via the amdgpu sysfs back-end — read even when NVIDIA is present, so a
@@ -149,7 +200,12 @@ def sample_once():
                 g["idx"] = base + i
         gpus = nv_gpus + amd_cards
         if not gpus:
-            raise ValueError("no NVIDIA or AMD GPU detected")
+            # "No GPU" and "the GPU tool is broken" are different facts. A
+            # driver update that leaves nvidia-smi dying with "Driver/library
+            # version mismatch" must light up as an incident, not quietly
+            # degrade the panel to "absent" (probe.py makes the same call).
+            gpu_error = _app.nvidia_failure()
+            raise ValueError(gpu_error or "no NVIDIA or AMD GPU detected")
         gpu_avail = True
         gpu_vendor = ("hybrid" if (nv_gpus and amd_cards)
                       else "amd" if amd_cards else "nvidia")
@@ -161,23 +217,63 @@ def sample_once():
         power     = sum(g["power"] for g in gpus)
         util      = round(sum(g["util"] for g in gpus) / len(gpus))
         temp      = max(g["temp"] for g in gpus)
-        # NVIDIA-only enrichment (clocks/throttle) + per-process VRAM attribution
+        # NVIDIA enrichment (clocks/throttle) + per-process VRAM attribution
         # (nvidia-smi compute-apps), applied to the NVIDIA cards only — the dicts are
         # the same objects held in `gpus`, so in-place enrichment shows through.
         if nv_gpus:
             _app._enrich_gpus(nv_gpus)
-            gpu_extra = _app._gpu_extra(nv_gpus)
-            for line in _app.smi(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).splitlines():
-                if line.strip():
-                    pid, mem = (p.strip() for p in line.split(","))
+            try:
+                # Best-effort on its own: a timeout or malformed row in this extra
+                # query must cost this sample's NVIDIA attribution, not the GPU
+                # chips below it nor the AMD fdinfo attribution that follows.
+                #
+                # gpu_uuid comes along so VRAM can be attributed to a *card*, not
+                # just to the pool — "which of the three 3090s is ollama on" is
+                # the question the per-card cockpit exists to answer. A driver
+                # that rejects the field falls back to the original query and
+                # simply reports no per-card split.
+                uuid_idx = _app._smi_uuid_idx()
+                rows = [l for l in _app.smi(["--query-compute-apps=gpu_uuid,pid,used_memory",
+                                             "--format=csv,noheader,nounits"]).splitlines()
+                        if l.strip()]
+                # CHECK the answer rather than inferring the shape from the fact
+                # that rows came back: nvidia-smi UUIDs are always "GPU-…" (or
+                # "MIG-…" on a partitioned card), so the leading field identifies
+                # itself. Guessing wrong here shifts every column by one. Same
+                # verification probe.py does — the two must not drift.
+                has_uuid = bool(rows) and all(
+                    r.strip().startswith(("GPU-", "MIG-")) for r in rows)
+                if not has_uuid:
+                    rows = _app.smi(["--query-compute-apps=pid,used_memory",
+                                     "--format=csv,noheader,nounits"]).splitlines()
+                for line in rows:
+                    if not line.strip():
+                        continue
+                    f = [x.strip() for x in line.split(",")]
+                    if len(f) < (3 if has_uuid else 2):
+                        continue
+                    uuid, (pid, mem) = (f[0], f[1:3]) if has_uuid else (None, f[:2])
                     svc = _app.service_for_pid(pid, nm)
-                    procs[svc] = procs.get(svc, 0) + _app._gpu_num(mem)
+                    mb = _app._gpu_num(mem)
+                    procs[svc] = procs.get(svc, 0) + mb
+                    idx = uuid_idx.get(uuid) if uuid else None
+                    if idx is not None:
+                        per = svc_by_card.setdefault(svc, {})
+                        per[idx] = per.get(idx, 0) + mb
                     try:
-                        gpu_pids[int(pid)] = gpu_pids.get(int(pid), 0) + _app._gpu_num(mem)
+                        gpu_pids[int(pid)] = gpu_pids.get(int(pid), 0) + mb
                     except ValueError:
                         pass
-        else:
-            gpu_extra = {}
+            except Exception:
+                logging.debug("per-PID GPU memory aggregation failed", exc_info=True)
+                pass
+        # Aggregate the 'GPU right now' chips from EVERY card, whatever the vendor:
+        # NVIDIA cards were enriched just above, AMD ones arrive already enriched
+        # (amd_gpus reads clocks/perf level/cap in its per-card pass). The pooled
+        # sums must span vendors — an NVIDIA-only aggregate on a hybrid box
+        # compares total draw (both vendors) against the NVIDIA cap alone, and the
+        # power chip reads >100% whenever the AMD card draws anything.
+        gpu_extra = _app._gpu_extra(gpus)
         # AMD per-process VRAM via DRM fdinfo (kernel 5.19+) — the amdgpu counterpart
         # of --query-compute-apps, feeding the same procs/gpu_pids pipeline so the
         # VRAM-allocation panel, VRAM-by-service chart, container VRAM column and GPU
@@ -203,44 +299,115 @@ def sample_once():
     # expired) or sits between requests still shows up as Idle instead of vanishing.
     # Probes are independent 2 s-timeout HTTP calls, so run them in parallel.
     ai = [c for c in conts if _match_probe(c)]
-    models = []
-    model_catalog = []   # {service, provider, model, loaded, vram_mb} — the Installed-models registry (#219)
-    if ai:
-        with ThreadPoolExecutor(max_workers=min(8, len(ai))) as ex:
-            found_lists = list(ex.map(probe_models, ai))
-        provider_of = {c["name"]: _match_probe_key(c) for c in ai}
-        for ct, found in zip(ai, found_lists):
-            svc = ct["name"]
-            provider = provider_of.get(svc)
-            smem = procs.get(svc)                         # MB this server holds on the GPU now
-            api_vram = any(v is not None for _, v in found)
-            for mdl, vram in found:
-                if vram is not None:                      # server reported its own VRAM (Ollama)
-                    vram_val = round(vram)
-                elif not api_vram and len(found) == 1 and smem:
-                    vram_val = round(smem)                # single model ↔ all the server's VRAM
-                else:
-                    vram_val = None                        # server up but idle / can't attribute
-                models.append((svc, mdl, vram_val))
-                model_catalog.append({"service": svc, "provider": provider, "model": mdl,
-                                       "loaded": vram_val is not None, "vram_mb": vram_val})
-
-    # Attribute model-server traffic to its callers (who is driving Ollama, etc.).
-    edges = _app.sample_callers(conts, {c["name"] for c in ai})
-
-    # Model intelligence: per-model metadata (Ollama /api/show, cached) + live serving
-    # telemetry (vLLM/TGI /metrics). Both best-effort — a slow/absent endpoint must
-    # never wedge the sample, so each is isolated.
+    # Plus the user-registered custom servers: auto-discovery only reaches
+    # the hub's containers on standard ports and remotes' localhost ollama, so a
+    # vLLM on another box at a non-standard port needs an explicit entry. A
+    # malformed setting degrades to "no custom servers", never to a broken sample.
+    custom_raw = _app.get_settings().get("custom_ai_servers") or ""
+    custom, _c_err = parse_custom_servers(custom_raw)
+    if _c_err or custom is None:
+        print(f"custom_ai_servers ignored ({_c_err or 'unparseable'}): {str(custom_raw)[:120]!r}", flush=True)
+        custom = []
+    # Fleet names the per-host AI Models tab filters on: "local" (the hub) plus
+    # the registered hosts. Read once per sample, not per row.
     try:
-        model_meta = _app.collect_model_meta(ai, models)
-    except Exception as e:
-        print(f"collectors/sample_once collect_model_meta error: {e}", flush=True)
-        model_meta = {}
+        _known_hosts = {"local"} | {h["name"] for h in _app.list_hosts()}
+    except Exception:
+        _known_hosts = {"local"}
+    for s in custom:
+        if any(c["name"] == s["name"] for c in ai):
+            continue                                    # container discovery already covers it
+        fleet = _resolve_fleet_host(s.get("fleet_host"), _known_hosts)
+        if fleet != (s.get("fleet_host") or "local"):
+            print(f"custom_ai_servers '{s['name']}': host '{s.get('fleet_host')}' "
+                  f"not registered — shown under the hub instead", flush=True)
+        ai.append({"name": s["name"], "ip": s["host"], "port": s["port"],
+                   "provider": s["provider"], "image": s["provider"],
+                   "ports": [s["port"]], "fleet_host": fleet})
+    models = []
+    model_catalog = []   # {host, service, provider, model, loaded, vram_mb} — the Installed-models registry (#219)
+    ai_servers = []      # {name, ip, port, provider, host} — for the /api/ai/now throttled live re-probe
+    # Every user-registered server, answering or not. A custom server whose
+    # probe returns nothing used to vanish from the tab without a trace — the
+    # user registered it, Test passed once, and from then on "down" and
+    # "never existed" looked identical. This list is what lets the UI say
+    # "registered for vader, not answering at host:port" instead.
+    custom_status = []   # {name, provider, host, target, reachable, models}
+    # Needed below, ahead of its usual place further down: every non-Ollama probe
+    # (vLLM, llama.cpp, TGI, …) always reports vram=None — it has no on-disk/loaded
+    # split the way Ollama does, so the *only* other way to attribute VRAM is the
+    # hub's own nvidia-smi process list, which can never see a process on a remote
+    # box. A custom server registered against a remote fleet_host would then show
+    # "not loaded" forever despite visibly serving traffic — its live /metrics
+    # telemetry (below) is the one host-independent signal that it's genuinely
+    # resident, so it has to be known before "loaded" is decided per model.
     try:
         serving = _app.collect_serving(ai)
     except Exception as e:
         print(f"collectors/sample_once collect_serving error: {e}", flush=True)
         serving = []
+    serving_services = {s["service"] for s in serving if s.get("service")}
+    if ai:
+        def _probe_one(ct):
+            # Containers ride the port-guessing PROBES table; custom descriptors
+            # carry the user's explicit port, so probe_custom_server owns them.
+            return probe_custom_server(ct) if "port" in ct else probe_models(ct)
+        with ThreadPoolExecutor(max_workers=min(8, len(ai))) as ex:
+            found_lists = list(ex.map(_probe_one, ai))
+        provider_of = {c["name"]: (c.get("provider") or _match_probe_key(c)) for c in ai}
+        ai_servers = [{"name": c["name"], "ip": c.get("ip") or "127.0.0.1",
+                       "port": c.get("port"), "provider": provider_of.get(c["name"]),
+                       "host": c.get("fleet_host") if "fleet_host" in c else "local"} for c in ai]
+        for ct, found in zip(ai, found_lists):
+            svc = ct["name"]
+            provider = provider_of.get(svc)
+            # The per-host AI Models tab groups /api/models by fleet name; the
+            # hub's rows must say "local" (its raw hostname matches no pill), and
+            # a custom server rides the fleet name it was registered for.
+            host_label = ct.get("fleet_host") if "fleet_host" in ct else "local"
+            if "port" in ct:                              # a custom (user-registered) server
+                custom_status.append({"name": svc, "provider": provider, "host": host_label,
+                                      "target": f"{ct.get('ip')}:{ct.get('port')}",
+                                      "reachable": bool(found), "models": len(found)})
+            smem = procs.get(svc)                         # MB this server holds on the GPU now
+            api_vram = any(v is not None for _, v, _, _ in found)
+            for mdl, vram, ram, ctx in found:
+                if vram is not None:                      # server reported its own VRAM (Ollama)
+                    vram_val = round(vram)
+                    ram_val = round(ram) if ram else 0    # spill into system RAM (0 = fully on GPU)
+                elif not api_vram and len(found) == 1 and smem:
+                    vram_val = round(smem)                # single model ↔ all the server's VRAM
+                    ram_val = None                        # attributed from nvidia-smi — spill unknown
+                else:
+                    vram_val = None                        # server up but idle / can't attribute
+                    ram_val = None
+                models.append((svc, mdl, vram_val, ram_val,
+                               ctx if vram_val is not None else None, host_label))
+                model_catalog.append({
+                    "host": host_label,
+                    "service": svc,
+                    "provider": provider,
+                    "model": mdl,
+                    # A model this server's own /metrics confirms is actively serving
+                    # is unambiguously loaded, VRAM or no VRAM figure to show for it.
+                    "loaded": vram_val is not None or svc in serving_services,
+                    "vram_mb": vram_val,
+                    "ram_mb": ram_val,
+                })
+
+    # Attribute model-server traffic to its callers (who is driving Ollama, etc.).
+    edges = _app.sample_callers(conts, {c["name"] for c in ai})
+
+    # Model intelligence: per-model metadata (Ollama /api/show, cached). Live serving
+    # telemetry (vLLM/TGI /metrics) was already collected above — collect_serving()
+    # tracks each service's token counter between calls to derive tok/s, so calling
+    # it a second time here would sample that delta over mere milliseconds instead
+    # of a full sample interval and report a garbage rate.
+    try:
+        model_meta = _app.collect_model_meta(ai, models)
+    except Exception as e:
+        print(f"collectors/sample_once collect_model_meta error: {e}", flush=True)
+        model_meta = {}
     try:
         training = _app.collect_training(gpu_pids)
     except Exception as e:
@@ -262,7 +429,13 @@ def sample_once():
     except Exception as e:
         print(f"collectors/sample_once read_rapl_power error: {e}", flush=True)
         rapl = {}
-    cpu_power, dram_power = rapl.get("cpu_w"), rapl.get("dram_w")
+    cpu_power, dram_power = rapl.get("cpu_power"), rapl.get("dram_power")
+    # Surface measured watts on the live snapshot so /metrics can export them.
+    # Only overwrite on a real reading — a transient {} from read_rapl_power keeps the last good value.
+    if cpu_power is not None:
+        _app.LATEST["cpu_power"] = cpu_power
+    if dram_power is not None:
+        _app.LATEST["dram_power"] = dram_power
     try:
         top_cpu = _app.collect_top_processes()
     except Exception as e:
@@ -274,6 +447,7 @@ def sample_once():
         return
     from backend.db.repos import system as system_repo
     from backend.db.repos import experiments as exp_repo
+    from backend.db.repos import gpu_samples as gpu_samples_repo
     # Read retention before acquiring LOCK — get_settings() also takes LOCK
     # (non-reentrant), so calling it inside the block would deadlock the thread.
     _retention = _app.get_retention_secs() if ts % 360 < _app.INTERVAL else None
@@ -287,20 +461,23 @@ def sample_once():
             " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(ts, *gcols, host["cpu"], host["ram_used"],
               host["ram_total"], host["load1"], host["ctemp"], cpu_power, dram_power)])
-        _app.DB.executemany("INSERT INTO proc VALUES(?,?,?)", [(ts, svc, mem) for svc, mem in procs.items()])
+        _app.DB.executemany("INSERT INTO proc(ts,service,mem,host) VALUES(?,?,?,'local')",
+                            [(ts, svc, mem) for svc, mem in procs.items()])
         pp_rows = _app._attribute_power_rows(ts, power, procs, cpu_power, top_cpu)
         if pp_rows:
             _app.DB.executemany("INSERT INTO power_proc(ts,kind,name,watts) VALUES(?,?,?,?)", pp_rows)
-        _app.DB.executemany("INSERT INTO models VALUES(?,?,?,?)",
-                            [(ts, svc, mdl, vram) for svc, mdl, vram in models if vram is not None])
+        _app.DB.executemany("INSERT INTO models(ts,service,model,vram,ram) VALUES(?,?,?,?,?)",
+                            [(ts, svc, mdl, vram, ram) for svc, mdl, vram, ram, _ctx, _h in models if vram is not None])
         _app.DB.executemany("INSERT INTO edges VALUES(?,?,?,?)",
                             [(ts, caller, server, n) for (caller, server), n in edges.items()])
-        # Per-GPU history only when there's more than one card (single-GPU rigs are
-        # already covered by the aggregate `samples` table) — keeps storage lean.
-        if gpu_avail and len(gpus) > 1:
-            _app.DB.executemany(
-                "INSERT INTO gpu_samples(ts,idx,util,mem_used,mem_total,power,temp) VALUES(?,?,?,?,?,?,?)",
-                [(ts, g["idx"], g["util"], g["mem_used"], g["mem_total"], g["power"], g["temp"]) for g in gpus])
+        # Per-card history for the hub's own cards, stored under host='local' so
+        # the GPU cockpit reads them through exactly the same query it uses for a
+        # remote. Written for single-card rigs too, now that the tab charts fan,
+        # memory-bandwidth and throttle state per card — none of which the pooled
+        # `samples` table carries, so "one card means the aggregate covers it" no
+        # longer holds.
+        if gpu_avail and gpus:
+            gpu_samples_repo.record(_app.DB, ts, "local", gpus, interval=_app.INTERVAL)
         _cur_net_rows = list(_app._net_rows(ts, nm))   # host NICs + per-container talkers (#30)
         _app.DB.executemany("INSERT INTO net_samples(ts,iface,bytes_in,bytes_out) VALUES(?,?,?,?)",
                        _cur_net_rows)
@@ -336,7 +513,7 @@ def sample_once():
                     _app.DB.executemany("INSERT INTO proc_io_samples(ts,pid,comm,read_bps,write_bps) "
                                    "VALUES(?,?,?,?,?)", _pio_rows)
         if _retention is not None:
-            for t in ("samples", "proc", "models", "edges", "events", "gpu_samples", "net_samples", "power_proc"):
+            for t in ("samples", "proc", "models", "edges", "events", "gpu_samples", "net_samples", "power_proc", "host_samples"):
                 _app.DB.executemany(f"DELETE FROM {t} WHERE ts<?", [(ts - _retention,)])
             _app.DB.executemany("DELETE FROM disk_io_samples WHERE ts<?", [(ts - _app._DISK_IO_RETENTION,)])
             _app.DB.executemany("DELETE FROM proc_io_samples WHERE ts<?", [(ts - _app._PROC_IO_RETENTION,)])
@@ -358,15 +535,104 @@ def sample_once():
             _app.sync_mlflow()
         except Exception as e:
             print("mlflow sync error:", e, flush=True)
+    # Private (not in LATEST → never serialized to clients): where the recognised
+    # AI servers live, so the /api/ai/now fast path can re-probe ollama on demand.
+    _app.AI_SERVERS = ai_servers
     _app.LATEST.update(ts=ts, util=util, mem_used=mem_used, mem_total=mem_total, power=power, temp=temp,
                   cpu_power=cpu_power, dram_power=dram_power, rapl=rapl.get("domains"),
                   gpu_avail=gpu_avail, gpu_vendor=gpu_vendor, gpus=gpus, gpu_extra=gpu_extra,
-                  procs=sorted(({"service": s, "mem": round(m)} for s, m in procs.items()), key=lambda x: -x["mem"]),
-                  models=[{"service": s, "model": m, "vram": v} for s, m, v in models],
+                  gpu_error=gpu_error,
+                  procs=sorted(({"service": s, "mem": round(m),
+                                 **({"by_card": {str(i): round(v) for i, v in sorted(svc_by_card[s].items())}}
+                                    if s in svc_by_card else {})}
+                                for s, m in procs.items()), key=lambda x: -x["mem"]),
+                  # `host` is the fleet name the row belongs to ("local" = the
+                  # hub): the hub probes a custom server registered for a
+                  # remote box, so without it the hub's own AI Models panel
+                  # listed that box's server under the hub.
+                  models=[{"service": s, "model": m, "vram": v, "ram": r, "ctx_now": c, "host": h}
+                          for s, m, v, r, c, h in models],
                   model_catalog=model_catalog,
+                  custom_servers=custom_status,
                   model_meta=model_meta, serving=serving, training=training, devtools=devtools,
                   callers=sorted(({"caller": c, "server": s, "conns": n} for (c, s), n in edges.items()),
                                  key=lambda x: -x["conns"]), host=host)
+    # Remember whether this sample carried cards, so a later sample without any
+    # reads as "telemetry lost" rather than "this hub never had a GPU".
+    _app.note_gpu_cards("local", {"gpus": gpus})
+    # Wake the SSE streams: the slow sample carries everything the fast lane
+    # can't (containers, models, VRAM attribution, callers), so a browser must
+    # not have to wait for the next fast tick to see it.
+    _app.bump_live()
+
+
+def fast_sample_once():
+    """Refresh the values a human watches move, and nothing else.
+
+    Writes no database rows on purpose. Everything priced in this project is
+    integrated from `samples` at INTERVAL spacing, so an extra row here would be
+    counted as a full interval of energy and inflate every cost figure on the
+    page — the fast lane exists to make the screen quicker, not the history
+    denser."""
+    import app as _app
+    host = _app.read_host_fast()
+    if host:
+        # Merge, never replace: read_host_fast() deliberately omits disks and the
+        # OS/hardware/network/security inventories, and assigning a fresh dict
+        # here would blank those panels between slow samples.
+        cur = dict(_app.LATEST.get("host") or {})
+        cur.update(host)
+        _app.LATEST["host"] = cur
+    # Only touch the GPU once the sampler has confirmed there is one, and only for
+    # NVIDIA: a GPU-less box must not spawn nvidia-smi every couple of seconds
+    # forever, and AMD's sysfs cards are refreshed by the sampler itself.
+    if _app.LATEST.get("gpu_avail") and (_app.LATEST.get("gpu_vendor") in ("nvidia", "hybrid")):
+        fresh = _app.gpu_cards_fast()
+        if fresh:
+            cards = _app.LATEST.get("gpus") or []
+            for c in cards:
+                upd = fresh.get(c.get("idx"))
+                if upd:
+                    c.update(upd)
+            # Re-pool the aggregates from the cards so the headline GPU numbers and
+            # the per-card panels can never disagree mid-interval. Same reductions
+            # sample_once uses — average utilisation, hottest card, summed watts.
+            if cards:
+                _app.LATEST["util"] = round(sum(c.get("util") or 0 for c in cards) / len(cards))
+                _app.LATEST["mem_used"] = sum(c.get("mem_used") or 0 for c in cards)
+                _app.LATEST["power"] = sum(c.get("power") or 0 for c in cards)
+                _app.LATEST["temp"] = max(c.get("temp") or 0 for c in cards)
+    _app.LATEST["fast_ts"] = int(time.time())
+    _app.bump_live()
+
+
+def fast_sampler():
+    import app as _app
+    """Loop the cheap re-read at the fast-interval setting (Settings -> General
+    -> Live refresh interval; get_fast_interval() re-reads it from the DB each
+    cycle, so a change takes effect on the next sleep with no restart needed).
+    Inert when the fast lane starts disabled (FAST_INTERVAL env var = 0) — the
+    whole thread returns immediately rather than looping idle."""
+    if not _app.FAST_INTERVAL:
+        return
+    # Prime the CPU delta before the first published reading, otherwise that
+    # reading is an average stretching back to boot rather than a live figure.
+    try:
+        _app.read_host_fast()
+    except Exception as e:
+        print("fast_sampler prime error:", e, flush=True)
+    time.sleep(_app.get_fast_interval())
+    while True:
+        secs = _app.get_fast_interval()
+        # Cached for live_payload() (SSE "now" + /api/data), which is hit far
+        # more often than this loop turns over and must stay DB-free.
+        _app.LATEST["fast_interval"] = secs
+        _heartbeat("fast_sampler", secs)
+        try:
+            fast_sample_once()
+        except Exception as e:
+            print("fast_sampler error:", e, flush=True)
+        time.sleep(secs)
 
 
 def collector():

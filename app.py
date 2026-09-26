@@ -20,6 +20,26 @@ Adding a new monitor (it's meant to be easy):
 """
 import os, re, sys, glob, time, json, socket, sqlite3, threading, subprocess, smtplib, http.client, urllib.parse, urllib.request, urllib.error, ipaddress, shlex, struct, shutil, tempfile, secrets, hmac, uuid, hashlib, email.message, fnmatch, errno
 from functools import wraps
+
+# ── One module, one copy ──────────────────────────────────────────────────────
+# The container entrypoint starts this file as a script (`python /app/app.py`),
+# which makes it the module "__main__". Everything under backend/ then reaches
+# back for globals with a lazy `import app as _app` — and because "app" was not
+# in sys.modules, that import used to execute this file a SECOND time, in full,
+# as a separate module object.
+#
+# Two copies of app.py in one process means: two SQLite connections, two LOCKs
+# that serialise nothing against each other, two LATEST dicts (the blueprints
+# read one, half the samplers write the other), and — because the worker threads
+# start at module level — two collectors, two host pollers, two notifiers. Every
+# remote was SSH-probed twice per interval, and the append-only tables collected
+# duplicate rows: 268 duplicate (ts, service) groups in `proc` and 10,663 in
+# `net_samples` in a single hour on the release build.
+#
+# Registering this module under "app" before any backend import runs makes that
+# lazy import resolve to the module already executing.
+if __name__ == "__main__":
+    sys.modules.setdefault("app", sys.modules["__main__"])
 try:
     import fcntl                       # Linux-only; used for per-iface IPv4 (SIOCGIFADDR)
 except ImportError:
@@ -34,10 +54,27 @@ try:
 except ImportError:
     _PROM_OK = False
 
-VERSION      = "0.26.0"
+VERSION      = "0.37.0"
 DB_PATH      = os.environ.get("DB_PATH", "/data/gpu.db")
 MCP_IDLE_SEC = 45   # seconds without MCP activity before the pill shows idle
 INTERVAL     = int(os.environ.get("SAMPLE_INTERVAL", "10"))
+# ── The fast lane ────────────────────────────────────────────────────────────
+# INTERVAL is the *storage* cadence, and it must stay that way: every energy and
+# cost figure in this project is `sum(watts) * INTERVAL / 3_600_000`, so a sample
+# that lands in the database at any other spacing is silently mispriced.
+#
+# FAST_INTERVAL is the *screen* cadence. A separate loop re-reads only the cheap
+# values — /proc for CPU/RAM/load/temperature, one nvidia-smi query for the cards
+# already discovered — refreshes them in LATEST and wakes the SSE stream. It never
+# writes a row, so history stays exactly as dense as it was, cost stays exact, and
+# the expensive half of a sample (Docker, model-server probes, caller attribution,
+# per-process VRAM) keeps running once per INTERVAL as before.
+#
+# 0 disables the fast lane entirely and the dashboard falls back to polling.
+FAST_INTERVAL = max(0, int(os.environ.get("FAST_INTERVAL", "2") or 0))
+if FAST_INTERVAL >= INTERVAL:
+    # A fast lane no faster than the sampler buys nothing and doubles the reads.
+    FAST_INTERVAL = 0
 _RETENTION_DAYS_DEFAULT = int(os.environ.get("RETENTION_DAYS", "180"))
 RETENTION    = _RETENTION_DAYS_DEFAULT * 86400
 _DISK_IO_RETENTION = 7 * 86400   # per-device disk-I/O history: dense, 7-day ring
@@ -94,19 +131,23 @@ app = Flask(__name__, static_url_path="/static", static_folder="static")
 # Phase 3.4: register API blueprints (in original @app.route declaration order)
 from backend.api.system import bp as _system_bp
 from backend.api.gpu import bp as _gpu_bp
+from backend.api.gpu_cockpit import bp as _gpu_cockpit_bp
 from backend.api.costs import bp as _costs_bp
 from backend.api.experiments import bp as _experiments_bp
 from backend.api.uptime_api import bp as _uptime_api_bp
 from backend.api.hosts_api import bp as _hosts_api_bp
 from backend.api.integrations import bp as _integrations_bp
+from backend.api.icons_api import bp as _icons_bp
 from backend.api.benchmarks import bp as _benchmarks_bp
 app.register_blueprint(_system_bp)
 app.register_blueprint(_gpu_bp)
+app.register_blueprint(_gpu_cockpit_bp)
 app.register_blueprint(_costs_bp)
 app.register_blueprint(_experiments_bp)
 app.register_blueprint(_uptime_api_bp)
 app.register_blueprint(_hosts_api_bp)
 app.register_blueprint(_integrations_bp)
+app.register_blueprint(_icons_bp)
 app.register_blueprint(_benchmarks_bp)
 
 # ── Prometheus gauges (defined once at module level) ──────────────────────────
@@ -145,22 +186,48 @@ if _PROM_OK:
         "gpu_temp":          _make_gauge("homelab_gpu_temp_c",          "GPU temperature (°C)",              ["gpu"]),
         "gpu_power":         _make_gauge("homelab_gpu_power_w",         "GPU power draw (W)",                ["gpu"]),
         "host_cpu":          _make_gauge("homelab_host_cpu_pct",        "Host CPU usage (%)"),
+        "host_cpu_power":    _make_gauge("homelab_host_cpu_power_w",    "Host CPU package power, RAPL (W)"),
+        "host_dram_power":   _make_gauge("homelab_host_dram_power_w",   "Host DRAM power, RAPL (W)"),
         "host_mem_used":     _make_gauge("homelab_host_mem_used_pct",   "Host memory used (%)"),
         "host_disk_used":    _make_gauge("homelab_host_disk_used_pct",  "Host disk used (%)",                ["mountpoint"]),
         "container_state":   _make_gauge("homelab_container_state",     "Container state (1=running)",       ["name", "state"]),
         "systemd_unit":      _make_gauge("homelab_systemd_unit_state",  "Systemd unit state (1=active)",     ["unit",  "state"]),
         "model_vram":        _make_gauge("homelab_model_loaded_vram_mb","Model VRAM loaded (MB)",             ["server", "model"]),
+        "model_ram":         _make_gauge("homelab_model_ram_spill_mb", "Model spill into system RAM (MB)",   ["server", "model"]),
         "models_installed":  _make_gauge("homelab_models_installed_total","AI models detected per provider (#219: loaded + idle catalogue)", ["provider"]),
     }
 LOCK = threading.Lock()
 _DB_MAINTENANCE = False   # True during backup/restore — collector skips DB writes
 _DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples(ts INTEGER PRIMARY KEY, util REAL, mem_used REAL, mem_total REAL, power REAL, temp REAL);
+-- Per-card GPU history for EVERY host, hub included (the hub stores itself as
+-- host='local'). One table rather than a hub table plus a remote one: the GPU
+-- cockpit renders local and remote through the same reader, and a second table
+-- would let the two drift. Pre-existing rows predate the host column and are
+-- migrated to 'local', which is exactly what they were.
 CREATE TABLE IF NOT EXISTS gpu_samples(ts INTEGER, idx INTEGER, util REAL, mem_used REAL, mem_total REAL, power REAL, temp REAL);
+-- Hourly per-card rollup. Rates are averaged, but temp/fan also keep a MAX:
+-- an hour that averaged 71 °C while peaking at 87 °C is an hour with a thermal
+-- problem, and an average would hide exactly the event worth seeing.
+-- throttle_secs counts the seconds the card reported a thermal/power throttle.
+CREATE TABLE IF NOT EXISTS gpu_samples_1h(
+  ts INTEGER NOT NULL, host TEXT NOT NULL DEFAULT 'local', idx INTEGER NOT NULL,
+  util REAL, mem_used REAL, mem_total REAL, power REAL,
+  temp REAL, temp_max REAL, fan REAL, fan_max REAL,
+  -- fan_cnt: how many of this hour's polls actually REPORTED a fan speed. The
+  -- fan average divides by this, not by cnt — otherwise a card that reports a
+  -- fan only intermittently has its average dragged toward zero, and near-zero
+  -- is precisely what the fan-stall alert fires on.
+  fan_cnt INTEGER DEFAULT 0,
+  throttle_secs INTEGER DEFAULT 0, cnt INTEGER DEFAULT 1,
+  PRIMARY KEY(ts, host, idx));
+CREATE INDEX IF NOT EXISTS idx_gpu_1h_host_ts ON gpu_samples_1h(host, ts);
 CREATE TABLE IF NOT EXISTS net_samples(ts INTEGER, iface TEXT, bytes_in INTEGER, bytes_out INTEGER);
 CREATE TABLE IF NOT EXISTS proc(ts INTEGER, service TEXT, mem REAL);
-CREATE TABLE IF NOT EXISTS models(ts INTEGER, service TEXT, model TEXT, vram REAL);
+CREATE TABLE IF NOT EXISTS models(ts INTEGER, service TEXT, model TEXT, vram REAL, ram REAL);
+CREATE INDEX IF NOT EXISTS idx_models_ts ON models(ts);
 CREATE TABLE IF NOT EXISTS edges(ts INTEGER, caller TEXT, server TEXT, conns INTEGER);
+CREATE INDEX IF NOT EXISTS idx_edges_ts ON edges(ts);
 CREATE TABLE IF NOT EXISTS events(ts INTEGER, service TEXT, kind TEXT, detail TEXT);
 CREATE TABLE IF NOT EXISTS disk_io_samples(ts INTEGER NOT NULL, device TEXT NOT NULL, read_mb_s REAL, write_mb_s REAL, util_pct REAL);
 CREATE INDEX IF NOT EXISTS idx_diskio_ts ON disk_io_samples(device, ts);
@@ -277,6 +344,27 @@ CREATE INDEX IF NOT EXISTS idx_samples_1m_ts     ON samples_1m(ts);
 CREATE INDEX IF NOT EXISTS idx_samples_1h_ts     ON samples_1h(ts);
 CREATE INDEX IF NOT EXISTS idx_net_samples_1m_ts ON net_samples_1m(ts);
 CREATE INDEX IF NOT EXISTS idx_net_samples_1h_ts ON net_samples_1h(ts);
+-- Per-host time-series (multi-host slice): one raw row per successful host poll
+-- plus an hourly rollup keyed (ts, host) — the same raw/1h split the hub uses
+-- for its own samples. Raw rows are retention-purged; the 1h rollup is kept
+-- (like samples_1h) and is what the Costs integration reads.
+CREATE TABLE IF NOT EXISTS host_samples(
+  ts INTEGER NOT NULL, host TEXT NOT NULL,
+  cpu REAL, ram_used REAL, ram_total REAL, load1 REAL, ctemp REAL,
+  gpu_util REAL, gpu_mem_used REAL, gpu_mem_total REAL,
+  gpu_power REAL, cpu_power REAL, dram_power REAL, gpu_temp REAL,
+  PRIMARY KEY(ts, host)
+);
+CREATE INDEX IF NOT EXISTS idx_host_samples_host_ts ON host_samples(host, ts);
+CREATE TABLE IF NOT EXISTS host_samples_1h(
+  ts INTEGER NOT NULL, host TEXT NOT NULL,
+  cpu REAL, ram_used REAL, ram_total REAL, load1 REAL, ctemp REAL,
+  gpu_util REAL, gpu_mem_used REAL, gpu_mem_total REAL,
+  gpu_power REAL, cpu_power REAL, dram_power REAL, gpu_temp REAL,
+  cnt INTEGER DEFAULT 1,
+  PRIMARY KEY(ts, host)
+);
+CREATE INDEX IF NOT EXISTS idx_host_samples_1h_host_ts ON host_samples_1h(host, ts);
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version TEXT PRIMARY KEY,
   applied_at INTEGER NOT NULL
@@ -309,6 +397,34 @@ _RUNS_MIGRATIONS = ("key_id TEXT",)
 _UPTIME_MIGRATIONS = ("cert_days_remaining INTEGER", "cert_expires_at INTEGER")
 # Per-check opt-in to the public status page (off by default).
 _UPTIME_CHECK_MIGRATIONS = ("public INTEGER NOT NULL DEFAULT 0",)
+# RAM-spill split for loaded models (ollama size - size_vram). NULL = unknown (non-ollama).
+_MODELS_MIGRATIONS = ("ram REAL",)
+# Per-card GPU history for every host (the GPU cockpit). `host` turns what was a
+# hub-only table into a fleet-wide one; existing rows are the hub's, so they
+# default to 'local' and stay valid. The rest is the telemetry the cockpit charts:
+# fan speed, memory-bandwidth utilisation, clocks, the power cap the draw is
+# measured against, memory-junction temp and the raw throttle bitmask (kept as a
+# mask, not as labels, so history can tell thermal throttling from power-capping
+# without re-parsing strings).
+_GPU_SAMPLE_MIGRATIONS = ("host TEXT NOT NULL DEFAULT 'local'", "fan REAL", "mem_util REAL",
+                          "clk_sm REAL", "clk_mem REAL", "power_limit REAL",
+                          "temp_mem REAL", "throttle INTEGER")
+# Same story for per-service VRAM: `proc` was implicitly the hub's own, so its
+# rows are 'local' and remotes now write alongside them.
+_PROC_MIGRATIONS = ("host TEXT NOT NULL DEFAULT 'local'",)
+# GPU temperature per host: host_samples has always pooled GPU util/VRAM/power
+# but silently dropped temperature, so a remote's thermal history simply didn't
+# exist. Both the raw table and the rollup gain it.
+_COLUMN_MIGRATIONS = (("host_samples", "gpu_temp REAL"),
+                      ("host_samples_1h", "gpu_temp REAL"),
+                      ("gpu_samples_1h", "fan_cnt INTEGER DEFAULT 0"))
+# Indexes that cover columns added by the migrations above. They cannot live in
+# _DB_SCHEMA: executescript runs BEFORE the ALTERs, so on an existing database
+# the column wouldn't exist yet and the whole script would fail.
+_POST_MIGRATION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_gpus_host_ts ON gpu_samples(host, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_proc_host_ts ON proc(host, ts)",
+)
 
 def _data_dir():
     return os.path.dirname(os.path.abspath(DB_PATH)) or "."
@@ -342,7 +458,12 @@ def _apply_schema_migrations(conn):
     _apply_schema_migrations_impl(conn, _DB_SCHEMA,
                                   _SAMPLE_MIGRATIONS, _HOST_MIGRATIONS,
                                   _RUNS_MIGRATIONS, _UPTIME_MIGRATIONS,
-                                  _UPTIME_CHECK_MIGRATIONS)
+                                  _UPTIME_CHECK_MIGRATIONS,
+                                  models_migrations=_MODELS_MIGRATIONS,
+                                  gpu_sample_migrations=_GPU_SAMPLE_MIGRATIONS,
+                                  proc_migrations=_PROC_MIGRATIONS,
+                                  column_migrations=_COLUMN_MIGRATIONS,
+                                  post_migration_indexes=_POST_MIGRATION_INDEXES)
     conn.executescript(_EDGE_STATE_MIGRATION)
 
 def _backfill_rollups(conn):
@@ -398,8 +519,106 @@ _apply_schema_migrations(DB)
 _backfill_rollups(DB)
 
 LATEST = {"ts": 0, "util": 0, "mem_used": 0, "mem_total": 24576, "power": 0, "temp": 0,
-          "procs": [], "models": [], "callers": [], "host": {}, "gpu_avail": None, "gpu_vendor": None, "gpus": [], "gpu_extra": {},
+          "cpu_power": None, "dram_power": None,
+          "procs": [], "models": [], "callers": [], "host": {}, "gpu_avail": None, "gpu_vendor": None, "gpus": [], "gpu_extra": {}, "gpu_error": None,
           "model_meta": {}, "serving": [], "training": [], "devtools": [], "model_catalog": []}
+# ── Live revision: the "something changed" signal the SSE stream rides on ────
+# Bumped by every producer that refreshes LATEST (the sampler, the fast lane) and
+# by the fleet poller. Readers wait on the condition rather than polling it, so an
+# idle stream costs one blocked thread and zero CPU, and a new sample reaches the
+# browser in the time it takes to serialize it.
+#
+# Lock order: LIVE_COND is a leaf. Never acquire LOCK or HOST_DATA_LOCK while
+# holding it — bump_live() touches nothing else for exactly that reason.
+LIVE_REV  = 0
+FLEET_REV = 0
+LIVE_COND = threading.Condition()
+
+def bump_live():
+    """Publish 'LATEST changed' to every waiting SSE stream."""
+    global LIVE_REV
+    with LIVE_COND:
+        LIVE_REV += 1
+        LIVE_COND.notify_all()
+
+def bump_fleet():
+    """Publish 'a remote host's data changed'. Separate from bump_live() so the
+    stream can send the fleet table only when the fleet actually moved, instead
+    of re-shipping every host on every 2 s local tick."""
+    global FLEET_REV
+    with LIVE_COND:
+        FLEET_REV += 1
+        LIVE_COND.notify_all()
+
+def fleet_payload():
+    """Compact per-host summary rows for the All-hosts table: local first, then
+    registered hosts in the order they were added. Served by /api/fleet and
+    pushed on the SSE `fleet` event — one builder, so poll and push can't drift."""
+    rows = [{"name": "local", "label": socket.gethostname() + " (this hub)",
+             "ssh_target": None, "host": enrich_os_upgrade(_local_now_snapshot()),
+             "at": int(time.time()), "online": True, "is_local": True,
+             "last_check": {"summary": {"overall": "ok"}},
+             # Verdict on whether this host's GPUs are actually being watched —
+             # the "light" every host-level surface (pill, tile, table) shows.
+             "gpu_telemetry": gpu_telemetry("local", LATEST)}]
+    hosts = list_hosts()
+    with HOST_DATA_LOCK:
+        for h in hosts:
+            entry = HOST_DATA.get(h["name"]) or {}
+            data  = entry.get("data") or {}
+            rows.append({
+                "name": h["name"],
+                "label": h["name"],
+                "ssh_target": h["ssh_target"],
+                "host": enrich_os_upgrade(data.get("host")) if data else None,
+                "at": entry.get("at"),
+                "online": _host_is_online(entry),
+                "is_local": False,
+                "last_check": h.get("last_check"),
+                "error": entry.get("error"),
+                "gpu_telemetry": gpu_telemetry(h["name"], data.get("host")) if data else None,
+            })
+    return {"hosts": rows, "interval": INTERVAL, "rev": FLEET_REV}
+
+def live_payload():
+    """The small live-values document: what /api/data returns as `now`, and
+    nothing else. No database work, no LOCK — this is the endpoint that has to
+    stay cheap enough to serve every couple of seconds.
+
+    LATEST is copied before serializing: the sampler updates it without holding
+    LOCK (it always has), so iterating the live dict could otherwise trip over a
+    key being added mid-serialization."""
+    now = live_now()
+    # Read the cached value fast_sampler() resolved on its last cycle, not a
+    # fresh get_fast_interval() — this route is deliberately DB-free and can be
+    # hit every second or faster by several open tabs; the interval itself only
+    # ever changes at that same cadence, so a cycle-old value costs nothing.
+    return {"version": VERSION, "rev": LIVE_REV, "interval": INTERVAL,
+            "fast_interval": LATEST.get("fast_interval") or FAST_INTERVAL,
+            "mem_total": now.get("mem_total") or 24576, "now": now}
+
+def live_now():
+    """LATEST as clients see it — the one place the hub's live block is prepared.
+
+    /api/data and /api/live (and the SSE `now` event behind it) both ship this
+    dict, and they used to reach for LATEST independently. Anything derived for
+    one of them was then silently missing from the other, which is exactly how
+    the AI Models tab ended up with a blank compute column while the GPU tab had
+    the numbers.
+
+    Derived here rather than at sample time so it can never go stale, and so a
+    spec table that gains a card starts answering for it on the next request
+    instead of the next poll.
+    """
+    from backend import gpuspec
+    now = dict(LATEST)
+    gpuspec.attach(now.get("gpus"))
+    return now
+
+# Where the recognised AI servers live ({name, ip, provider}) — kept OUTSIDE
+# LATEST on purpose: LATEST is served wholesale as /api/data "now", and internal
+# container IPs don't belong in a browser payload. Refreshed each sample.
+AI_SERVERS = []
 # Current state of the "status" monitors (Docker + systemd). The background
 # collector refreshes these; /api/health just serves the cached snapshot.
 HEALTH = {"docker": None, "systemd": None, "update": None, "processes": None, "at": 0}
@@ -408,6 +627,9 @@ SYSTEMD_ADMIN_DIR = "/etc/systemd/system/"   # units here are admin/user-authore
 _ct_cache = {"list": [], "at": 0}
 _scan_since = {}
 _cpu_prev = {"idle": 0, "total": 0}
+# The fast lane's own /proc/stat counters — see _cpu_pct() on why these can't be
+# shared with the sampler's.
+_cpu_prev_fast = {"idle": 0, "total": 0}
 
 # ── Docker API over the unix socket ────────────────────────────────────────────
 def _docker_req(method, path, body=None, timeout=8):
@@ -475,7 +697,9 @@ from backend.probes import (
     probe_ollama, probe_tgi, probe_koboldcpp, probe_invokeai, probe_a1111,
     probe_whisper_asr, probe_triton, probe_wyoming, probe_comfy,
     PROBES, _match_probe, _match_probe_key, CATALOG_MAX, probe_models,
+    validate_custom_servers,
 )
+from backend.shortcuts import parse_shortcuts, validate_shortcuts
 
 # ── Model intelligence: per-model metadata + live serving telemetry ───────────
 # Two passive, no-dep enrichments that make the AI Models tab authoritative:
@@ -501,7 +725,35 @@ def _http_text(ip, port, path, timeout=2):
         c.close()
     return data.decode("utf-8", "replace") if status < 400 else None
 
-_OLLAMA_META = {}   # model name -> {param_size, quant, ctx, caps}; immutable per tag, cached
+_OLLAMA_META = {}   # model name -> {param_size, quant, ctx, caps, weights_mb}; immutable per tag, cached
+
+# Per-IP cache of ollama's on-disk model sizes (/api/tags `size`). The GGUF file
+# is what gets mapped into VRAM/RAM, so it ≈ the *weights* part of a loaded
+# model's residency; total resident − weights = context/KV cache + compute
+# buffers — the split that explains WHY a model spills into system RAM.
+_OLLAMA_TAGS = {}            # ip -> {"at": ts, "sizes": {model_name: bytes}}
+_OLLAMA_TAGS_TTL = 600       # steady-state refetch cadence
+_OLLAMA_TAGS_MIN_GAP = 60    # floor between refetches when a loaded model is unknown
+
+def _ollama_weights_mb(ip, model):
+    """Weights footprint (MB) for an ollama model from the cached /api/tags size.
+    Refetches at most once per _OLLAMA_TAGS_MIN_GAP when an unknown loaded model
+    appears (fresh pull), else every _OLLAMA_TAGS_TTL. Never raises; a failed
+    fetch keeps the previous sizes and backs off."""
+    now = time.time()
+    c = _OLLAMA_TAGS.get(ip)
+    if (not c or now - c["at"] > _OLLAMA_TAGS_TTL
+            or (model not in c["sizes"] and now - c["at"] > _OLLAMA_TAGS_MIN_GAP)):
+        sizes = dict((c or {}).get("sizes") or {})
+        try:
+            d = _http_json(ip, 11434, "/api/tags", timeout=3) or {}
+            sizes = {m["name"]: m["size"] for m in d.get("models", [])
+                     if m.get("name") and m.get("size")}
+        except Exception:
+            pass                                   # keep old sizes, back off via "at"
+        c = _OLLAMA_TAGS[ip] = {"at": now, "sizes": sizes}
+    b = c["sizes"].get(model)
+    return round(b / 1048576) if b else None
 
 def _ollama_meta(ip, model):
     """POST /api/show once per model and cache. Passive — triggers no inference."""
@@ -532,7 +784,7 @@ def collect_model_meta(ai, models):
     is_ollama = {ct["name"] for ct in ai
                  if "ollama" in (ct.get("name", "") + " " + ct.get("image", "")).lower()}
     out = {}
-    for svc, mdl, vram in models:
+    for svc, mdl, vram, *_ in models:               # rows are (svc, mdl, vram, ram[, ctx])
         if svc not in is_ollama or not mdl:
             continue
         if mdl in _OLLAMA_META:
@@ -541,6 +793,14 @@ def collect_model_meta(ai, models):
             meta = _ollama_meta(ip_of.get(svc, "127.0.0.1"), mdl)
             if meta:
                 out[mdl] = meta
+        # Weights split (cheap cached /api/tags): attach for loaded models still
+        # missing it. Mutating the returned dict also fills the _OLLAMA_META cache
+        # entry, so a transient tags failure heals on a later sample.
+        m = out.get(mdl)
+        if m is not None and vram is not None and "weights_mb" not in m:
+            w = _ollama_weights_mb(ip_of.get(svc, "127.0.0.1"), mdl)
+            if w:
+                m["weights_mb"] = w
     return out
 
 _PROM_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([0-9.eEnaN+-]+)\s*$")
@@ -628,16 +888,80 @@ def collect_serving(ai):
             _SERVE_PREV[name] = (gen, nowt)
         if st:
             st["service"] = name
+            # Same fleet-name stamp probe_models/probe_custom_server apply to models
+            # (see collectors.sample_once's host_label): a custom server registered
+            # for a remote box must carry that box's name here too, or its live
+            # tok/s telemetry is unattributable and only the hub-local AI Models
+            # panel (which doesn't filter by host) ever shows it.
+            st["host"] = ct.get("fleet_host") if "fleet_host" in ct else "local"
             out.append(st)
     return out
 
+# ── AI-tab fast path: throttled on-demand re-probe of ollama's /api/ps ────────
+# The sampler runs every INTERVAL (10s default) and the dashboard's global poll
+# every 15s, so the AI tab could lag ~25s behind a load/unload. /api/ai/now
+# serves a fresher view: re-probe just the ollama servers (one cheap HTTP call
+# each, 2s timeout) at most every _AI_NOW_TTL seconds, merged over LATEST for
+# everything else. No DB, no LOCK; network I/O happens outside any held lock.
+_AI_NOW_LOCK = threading.Lock()
+_AI_NOW_CACHE = {"at": 0.0, "models": None}
+_AI_NOW_TTL = float(os.environ.get("AI_NOW_TTL", "3"))
+
+def ai_models_now():
+    """Return (models, probed_at) — LATEST.models with the ollama entries
+    replaced by a just-probed view when the cache is stale. Shape matches
+    LATEST['models'] rows exactly ({service, model, vram, ram, ctx_now, host})."""
+    now = time.time()
+    with _AI_NOW_LOCK:
+        if _AI_NOW_CACHE["models"] is not None and now - _AI_NOW_CACHE["at"] < _AI_NOW_TTL:
+            return list(_AI_NOW_CACHE["models"]), _AI_NOW_CACHE["at"]
+    base = list(LATEST.get("models") or [])
+    fresh = {}                                      # svc -> replacement rows
+    for srv in list(AI_SERVERS):
+        if srv.get("provider") != "ollama":
+            continue
+        try:
+            # srv's port is None for container-discovered ollama (probe_ollama
+            # defaults to 11434); custom ollama servers carry their user port.
+            rows = probe_ollama(srv.get("ip") or "127.0.0.1", srv.get("port") or 11434)
+        except Exception:
+            continue                                # keep the sampler's view for this svc
+        if not rows:                                # unreachable/empty → don't blank the tab
+            continue
+        out = []
+        for r in rows:                              # loaded rows are 4-wide, idle fallback 2-wide
+            name, vram, ram, ctx = (tuple(r) + (None, None))[:4]
+            loaded = vram is not None
+            out.append({"service": srv["name"], "model": name,
+                        "vram": round(vram) if loaded else None,
+                        "ram": (round(ram) if ram else 0) if loaded else None,
+                        "ctx_now": ctx if loaded else None,
+                        "host": srv.get("host") or "local"})
+        fresh[srv["name"]] = out
+    models = [m for m in base if m.get("service") not in fresh]
+    for out in fresh.values():
+        models.extend(out)
+    with _AI_NOW_LOCK:
+        _AI_NOW_CACHE.update(at=now, models=models)
+    return list(models), now
+
 # ── Host metrics (read from /proc, /sys, statvfs — host values via shared kernel)
-def _cpu_pct():
+def _cpu_pct(state=None):
+    """CPU busy % since this caller's previous reading.
+
+    `state` carries the previous counters, and every concurrent caller MUST bring
+    its own. /proc/stat is cumulative, so the figure is entirely a function of the
+    delta between two reads: two loops sharing one state dict each consume the
+    other's interval and both report a window neither of them meant to measure —
+    the 10 s sampler would silently be storing a 2 s figure. The fast lane keeps
+    _cpu_prev_fast for exactly this reason."""
+    if state is None:
+        state = _cpu_prev
     parts = list(map(int, open("/proc/stat").readline().split()[1:]))
     idle, total = parts[3] + parts[4], sum(parts)
-    di, dt = idle - _cpu_prev["idle"], total - _cpu_prev["total"]
-    _cpu_prev.update(idle=idle, total=total)
-    return round(100 * (dt - di) / dt, 1) if dt > 0 and _cpu_prev["total"] else 0.0
+    di, dt = idle - state["idle"], total - state["total"]
+    state.update(idle=idle, total=total)
+    return round(100 * (dt - di) / dt, 1) if dt > 0 and state["total"] else 0.0
 
 def read_disks():
     # Read the *host* mount table (PID 1 lives in the host mount namespace), then
@@ -923,6 +1247,81 @@ def read_host():
     h["sec"] = _cached_inv("sec", 300, _local_sec)
     return h
 
+def read_host_fast():
+    """The moving half of read_host(): four /proc reads and the temperature.
+
+    Deliberately does NOT call read_disks() (a statvfs per mounted filesystem) or
+    any of the _cached_inv inventories (OS/hardware/network/security) — those
+    change on the scale of minutes to reboots, and re-reading them every couple of
+    seconds is the entire cost this fast lane exists to avoid. The sampler keeps
+    refreshing them at INTERVAL; the fast lane merges over the top and leaves them
+    in place."""
+    h = {}
+    try: h["cpu"] = _cpu_pct(_cpu_prev_fast)
+    except Exception: pass
+    try:
+        mi = {}
+        for ln in open("/proc/meminfo"):
+            mi[ln.split(":")[0]] = int(ln.split()[1])
+        h["ram_total"] = round(mi["MemTotal"] / 1024)
+        h["ram_used"] = round((mi["MemTotal"] - mi.get("MemAvailable", mi.get("MemFree", 0))) / 1024)
+        h["ram_kernel"] = round((mi.get("SUnreclaim", 0) + mi.get("KernelStack", 0)
+                                 + mi.get("PageTables", 0)) / 1024)
+    except Exception:
+        pass
+    try: h["load1"] = float(open("/proc/loadavg").read().split()[0])
+    except Exception: pass
+    try: h["uptime"] = int(float(open("/proc/uptime").read().split()[0]))
+    except Exception: pass
+    try: h["ctemp"] = _cpu_temp_c()
+    except Exception: pass
+    return h
+
+def gpu_cards_fast():
+    """Refresh util/VRAM/power/temp/fan for the cards the sampler already found.
+
+    One nvidia-smi query, and only the volatile fields — no compute-app
+    attribution, no clock/throttle enrichment, no card discovery. Matching cards
+    by index and updating in place is the point: appearing and disappearing cards
+    are the sampler's business, so the fast lane can never invent a card, renumber
+    the AMD block, or disagree with the per-card history in the database.
+
+    Returns {idx: {field: value}} for the caller to merge. {} on any failure — a
+    wedged driver degrades the refresh rate of the GPU chips, nothing else."""
+    out = {}
+    base_fields = "index,utilization.gpu,memory.used,power.draw,temperature.gpu"
+    try:
+        # fan.speed is asked for in the same pass, but nvidia-smi rejects the WHOLE
+        # query on an unrecognised field name — so a driver too old to know it
+        # falls back to the exact base query rather than reporting no cards at all
+        # (same fallback the full sampler uses for this same field).
+        rows = smi([f"--query-gpu={base_fields},fan.speed",
+                    "--format=csv,noheader,nounits"]).splitlines()
+        if not any(line.strip() for line in rows):
+            rows = smi([f"--query-gpu={base_fields}",
+                        "--format=csv,noheader,nounits"]).splitlines()
+    except Exception:
+        return {}
+    for line in rows:
+        if not line.strip():
+            continue
+        p = [x.strip() for x in line.split(",")]
+        if len(p) < 5:
+            continue
+        try:
+            idx = int(_gpu_num(p[0]))
+        except (TypeError, ValueError):
+            continue
+        card = {"util": _gpu_num(p[1]), "mem_used": _gpu_num(p[2]),
+                "power": _gpu_num(p[3]), "temp": _gpu_num(p[4])}
+        # Absent, not 0: a passively-cooled card has no fan to report, and a 0
+        # here would trip the fan-stall alert on hardware that has none to stall.
+        fan = _gpu_opt(p[5]) if len(p) > 5 else None
+        if fan is not None:
+            card["fan"] = round(fan)
+        out[idx] = card
+    return out
+
 # ── System / Hardware / Network / Security inventory (local hub) ──────────────
 # Mirror of probe.py's read_os/hw/net/sec for the box the hub itself runs on.
 # The container shares the host PID + network namespaces (pid:host,
@@ -995,8 +1394,8 @@ def _rapl_domains():
     return out
 
 def read_rapl_power():
-    """Per-interval RAPL watts, or {} when unavailable. Keys: cpu_w (psys if present
-    else sum of package-* domains), dram_w (sum of dram sub-domains), domains{name:w}.
+    """Per-interval RAPL watts, or {} when unavailable. Keys: cpu_power (psys if present
+    else sum of package-* domains), dram_power (sum of dram sub-domains), domains{name:w}.
     First call after start seeds state and returns {} (no prior delta)."""
     domains = _rapl_domains()
     if not domains:
@@ -1025,10 +1424,10 @@ def read_rapl_power():
     psys = per.get("psys")
     pkgs = [w for n, w in per.items() if n.startswith("package")]
     cpu_w = psys if psys is not None else (sum(pkgs) if pkgs else None)
-    drams = [w for n, w in per.items() if n == "dram" or n.endswith(":dram")]
-    dram_w = round(sum(drams), 1) if drams else None
-    return {"cpu_w": (round(cpu_w, 1) if cpu_w is not None else None),
-            "dram_w": dram_w, "domains": {n: round(w, 1) for n, w in per.items()}}
+    drams = [w for n, w in per.items() if n == "dram"]
+    dram_power = round(sum(drams), 1) if drams else None
+    return {"cpu_power": (round(cpu_w, 1) if cpu_w is not None else None),
+            "dram_power": dram_power, "domains": {n: round(w, 1) for n, w in per.items()}}
 
 _POWER_PROC_TOPN  = 8
 _POWER_PROC_MIN_W = 0.5
@@ -1192,17 +1591,31 @@ def _local_hw():
         hw["machine"] = machine
     # GPU name isn't kept on LATEST (only util/mem), so ask nvidia-smi once (cached).
     try:
-        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
+        # Per-card list (index,name,memory.total) so the System tab's Hardware
+        # card can name EVERY card, not just the first — a 2- or 3-card box used
+        # to report only its GPU 0. The legacy single-card gpu_name/gpu_mem_total
+        # are kept (first card) so any older client still renders a GPU line.
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total",
                             "--format=csv,noheader,nounits"], capture_output=True, timeout=3)
         if r.returncode == 0:
-            line = r.stdout.decode("utf-8", "replace").splitlines()[0]
-            nm, _, mt = line.partition(",")
-            if nm.strip():
-                hw["gpu_name"] = nm.strip()
-            try:
-                hw["gpu_mem_total"] = int(mt.strip())
-            except ValueError:
-                pass
+            cards = []
+            for line in r.stdout.decode("utf-8", "replace").splitlines():
+                if not line.strip():
+                    continue
+                idx, _, rest = line.partition(",")
+                nm, _, mt = rest.partition(",")
+                try:
+                    mem = int(mt.strip())
+                except ValueError:
+                    mem = None
+                if nm.strip():
+                    cards.append({"idx": int(idx) if idx.strip().isdigit() else len(cards),
+                                  "name": nm.strip(), "mem_total": mem})
+            if cards:
+                hw["gpus"] = cards
+                hw["gpu_name"] = cards[0]["name"]
+                if cards[0]["mem_total"] is not None:
+                    hw["gpu_mem_total"] = cards[0]["mem_total"]
     except Exception:
         pass
     return hw
@@ -1627,10 +2040,11 @@ def _container_disk(ct, prev=None, shared=frozenset()):
     """A container's real on-disk footprint: writable layer (SizeRw) + every
     read-write volume and bind mount it owns. Read-only mounts (configs, the
     docker socket, our own /rootfs) aren't this container's data, so they're
-    skipped, and so are sources in `shared` — a bind/volume mounted by more than
-    one container (e.g. a common /srv/share) belongs to none of them, and counting
-    it under each both double-counts and makes unrelated rows show the same huge
-    number. Falls back toward SizeRw alone when host paths can't be measured —
+    skipped, and so are sources in `shared` — data reachable read-write from more
+    than one container (e.g. a common /srv/share, or a directory another container
+    covers by mounting its parent) belongs to none of them, and counting it under
+    each both double-counts and makes unrelated rows show the same huge number.
+    Falls back toward SizeRw alone when host paths can't be measured —
     e.g. HOST_ROOT not mounted — which is the old behaviour.
 
     `prev` is this container's last computed total: if a mount's `du` overruns
@@ -1641,8 +2055,8 @@ def _container_disk(ct, prev=None, shared=frozenset()):
     for m in (ct.get("Mounts") or []):
         if not m.get("RW") or m.get("Type") not in ("volume", "bind"):
             continue
-        src = m.get("Source")
-        if not src or not src.startswith("/") or src in shared:
+        src = _norm_src(m.get("Source"))
+        if not src or src in shared:
             continue
         sz = _dir_size(src)
         if sz is None:
@@ -1653,19 +2067,85 @@ def _container_disk(ct, prev=None, shared=frozenset()):
         return max(total, prev)
     return total
 
+def _norm_src(src):
+    """A mount source as a normalised host path, or None when it isn't one.
+
+    Podman reports pseudo-sources (`devpts`, `tmpfs`) for some mounts and
+    `_container_disk` has always skipped anything not absolute; the sharing check
+    has to apply the same rule and the same normalisation, or the two disagree
+    about what a source is and the `src in shared` skip silently misses."""
+    if not src or not src.startswith("/"):
+        return None
+    p = os.path.normpath(src)
+    return p[1:] if p.startswith("//") else p   # POSIX keeps a leading "//" verbatim
+
+def _covers(parent, child):
+    """True when `parent` is a *strict* ancestor directory of `child`.
+
+    Both arguments must already be normalised (see `_norm_src`). Compared per path
+    component, so `/srv` doesn't "contain" `/srvfoo`, and `/` is an ancestor of
+    every other absolute path. Equality is deliberately False: the caller treats
+    "someone mounts the same source" and "someone mounts a directory above mine"
+    as two different cases.
+
+    Purely lexical, so it can't see through symlinks: if `/srv/models` is a link
+    to `/mnt/disk/models` and another container mounts `/mnt/disk`, the sharing
+    goes unnoticed. Resolving that would mean `realpath` against the host rootfs,
+    which isn't always mounted — the pre-existing behaviour, left alone."""
+    if parent == child:
+        return False
+    return True if parent == "/" else child.startswith(parent + "/")
+
+_shared_note = {"seen": frozenset()}
+
 def _shared_mount_sources(sized):
-    """Sources (volume/bind) mounted read-write by more than one container — i.e.
-    shared infrastructure that shouldn't be attributed to any single container."""
-    users = {}
-    for ct in sized:
-        seen = set()
+    """Sources (volume/bind) that shouldn't be attributed to any single container.
+
+    Two ways a source qualifies:
+
+    - **Another container mounts the same source.** The original rule, unchanged.
+    - **Another container mounts a directory above it.** New, and the reason this
+      function was touched: a container mounting `/srv/models` and another mounting
+      `/` (what toolbox and distrobox do, at `/run/host`) write the same bytes, but
+      no two sources match as strings. The whole tree used to be billed to the one
+      container that named it — on the host that prompted this, a container stopped
+      for two weeks with a 40.9 kB writable layer was charged 1.25 TB.
+
+    The check is deliberately **one-directional**: mounting a parent does not make
+    you lose it because someone else mounted a subdirectory of yours. A container
+    with 500 GB under `/srv/media` keeps being billed for it when another mounts
+    only `/srv/media/photos` — the sub-tree stops being double-counted, and the
+    exclusive part doesn't vanish from the report. Nesting between two mounts of
+    the *same* container is not sharing either."""
+    owners = {}                                    # source -> set of container indexes
+    for i, ct in enumerate(sized):
         for m in (ct.get("Mounts") or []):
             if m.get("RW") and m.get("Type") in ("volume", "bind"):
-                src = m.get("Source")
-                if src and src not in seen:        # a container mounting it twice still counts once
-                    seen.add(src)
-                    users[src] = users.get(src, 0) + 1
-    return frozenset(src for src, n in users.items() if n > 1)
+                src = _norm_src(m.get("Source"))
+                if src:
+                    owners.setdefault(src, set()).add(i)   # mounted twice still counts once
+    shared, covered = set(), set()
+    for src, mine in owners.items():
+        if len(mine) > 1:
+            shared.add(src)
+            continue
+        for other, theirs in owners.items():
+            if _covers(other, src) and theirs - mine:
+                shared.add(src)
+                covered.add(src)
+                break
+    # A parent mount can silently empty the disk column for a whole host (one
+    # container with `/` read-write covers everything), so say it once when the
+    # set changes rather than let the numbers disappear without explanation.
+    if covered != _shared_note["seen"]:
+        _shared_note["seen"] = frozenset(covered)
+        if covered:
+            names = sorted(covered)
+            head = ", ".join(names[:3]) + (f" (+{len(names) - 3} more)" if len(names) > 3 else "")
+            print(f"NOTE: not billing {head} to any container — another container mounts a "
+                  f"parent directory read-write, so that data isn't exclusively theirs",
+                  flush=True)
+    return frozenset(shared)
 
 def _refresh_docker_disk():
     """Measure every container's footprint (running or stopped — stopped
@@ -2855,8 +3335,11 @@ def collect_top_processes(top_n=10):
         proc_io = collect_proc_disk_io(list(cand.values()))
     except Exception:
         proc_io = {"available": False}
-    return {"by_cpu": sorted(rows, key=lambda r: -r["cpu_pct"])[:top_n],
-            "by_mem": sorted(rows, key=lambda r: -r["mem_mb"])[:top_n],
+    # Tie-break on the other metric — see probe.read_cpu_and_procs(), which
+    # sorts identically. Idle commands all sit at 0.0% and would otherwise fall
+    # back to /proc order (lowest pid first, i.e. kernel threads).
+    return {"by_cpu": sorted(rows, key=lambda r: (-r["cpu_pct"], -r["mem_mb"]))[:top_n],
+            "by_mem": sorted(rows, key=lambda r: (-r["mem_mb"], -r["cpu_pct"]))[:top_n],
             "ncpu": ncpu, "io": proc_io}
 
 # ── Experiments: training-run detection + GPU activity sessions ────────────────
@@ -3121,6 +3604,44 @@ def delete_host(name):
         rowcount = _hosts_repo.delete(name, conn=DB)
     return rowcount > 0
 
+def rename_host(old, new):
+    """Rename a registered host. The hosts row moves as-is (SSH target, tags,
+    poll calibration, last check), the in-memory poll cache is re-keyed so the
+    UI doesn't fall back to "no data yet" for a poll interval, and experiment /
+    benchmark history recorded under the old name follows so per-host filters
+    don't silently split. Returns (host_dict, error_or_None)."""
+    from backend.db.repos import hosts as _hosts_repo
+    new = (new or "").strip()
+    if not _HOST_NAME_RE.match(new):
+        return None, "Name must be 1–31 chars: letters, digits, '_' or '-', starting with a letter or digit."
+    if new.lower() == "local":
+        return None, "'local' is reserved for the hub itself."
+    if new == old:
+        return None, "Nothing to update."
+    with LOCK:
+        try:
+            rowcount = _hosts_repo.rename(old, new, conn=DB)
+        except sqlite3.IntegrityError:
+            return None, f"A host named '{new}' already exists."
+        if rowcount == 0:
+            return None, f"No host named '{old}'."
+        DB.execute("UPDATE runs SET host=? WHERE host=?", (new, old))
+        DB.execute("UPDATE bench_runs SET host=? WHERE host=?", (new, old))
+        from backend.db.repos import host_samples as _hs_repo
+        _hs_repo.rename_host(old, new, conn=DB)
+        # Per-card GPU history and per-service VRAM are keyed by host name too;
+        # without this a rename orphans the whole cockpit history under the old
+        # name while the renamed host shows an empty GPU tab.
+        from backend.db.repos import gpu_samples as _gs_repo
+        _gs_repo.rename_host(old, new, conn=DB)
+        DB.commit()
+    with HOST_DATA_LOCK:
+        if old in HOST_DATA:
+            HOST_DATA[new] = HOST_DATA.pop(old)
+    with LOCK:
+        row = _hosts_repo.get(new, conn=DB)
+    return {"name": row[0], "ssh_target": row[1], "tags": row[2]}, None
+
 def update_host(name, ssh_target=None, tags=None):
     """Patch an existing host. Returns (host_dict, error_or_None). The cached
     last-check result is cleared because the old probe no longer applies to the
@@ -3343,6 +3864,12 @@ def _local_now_snapshot():
     for k in ("os", "hw", "net", "sec"):
         if H.get(k):
             out[k] = H[k]
+    # RAPL power — top-level in LATEST (not inside host), so pull explicitly.
+    # Mirrors the shape probe.py emits for remotes (cpu_power/dram_power in host).
+    for k in ("cpu_power", "dram_power"):
+        v = (LATEST or {}).get(k)
+        if v is not None:
+            out[k] = v
     # GPU summary — the existing collector already keeps these on LATEST's top
     # level. Re-use them so the All-hosts row for `local` matches the shape
     # probe.py emits for remotes.
@@ -3357,6 +3884,9 @@ def _local_now_snapshot():
             "util":      (LATEST or {}).get("util", 0),
             "temp":      (LATEST or {}).get("temp", 0),
         }
+    # Same key a remote's probe emits, so the per-host tabs read one shape.
+    if (LATEST or {}).get("gpu_error"):
+        out["gpu_error"] = LATEST["gpu_error"]
     return out
 
 # ── Adaptive per-host poll timeout (issue #99) ────────────────────────────────
@@ -3467,8 +3997,189 @@ def _poll_one_host(h):
                 entry["error_at"] = int(time.time())
                 entry["fails"]    = int(entry.get("fails", 0)) + 1
             HOST_DATA[h["name"]] = entry
+        # Push the fleet the moment a poll lands. A remote's cadence is still the
+        # poller's — its data comes over SSH and making that faster would cost
+        # real network — but the browser no longer waits out its own poll on top
+        # of it, which was up to 15 s of pure queueing latency per host.
+        bump_fleet()
+        if data:
+            note_gpu_cards(h["name"], data.get("host") or {})
+            _record_host_sample(h["name"], data.get("host") or {})
     except Exception as e:
         print(f"host poll error ({h.get('name')}):", e, flush=True)
+
+# ── GPU telemetry loss ───────────────────────────────────────────────────────
+# {host: ts of the last poll that carried at least one GPU card}. This is what
+# makes "no cards in this poll" distinguishable from "this box never had a GPU":
+# the first is an incident (a driver update broke nvidia-smi, a card fell off the
+# bus), the second is a Raspberry Pi. In memory, seeded once per host from the
+# per-card history so a hub restart mid-incident doesn't forget the cards.
+_GPU_LAST_CARDS = {}
+# {host: {idx: card name}} from the last poll that carried cards, so a card the
+# host has stopped describing is still shown by name ("NVIDIA GeForce RTX 3090"),
+# not as a bare "GPU 0" — the history table stores numbers, not names.
+_GPU_LAST_NAMES = {}
+_GPU_LAST_CARDS_LOCK = threading.Lock()
+# Past this, a host that stopped reporting cards is treated as having had them
+# removed on purpose (same window the notifier uses to retire a missing card),
+# and the indicator clears rather than nagging forever.
+GPU_LOST_FORGET_S = 3600
+
+def note_gpu_cards(name, hostd):
+    """Remember whether this poll of `name` carried GPU cards. Called on every
+    successful poll (and every hub sample), before anything reads the state."""
+    cards = (hostd or {}).get("gpus") or []
+    with _GPU_LAST_CARDS_LOCK:
+        if name not in _GPU_LAST_CARDS:
+            # First sighting in this process: what did the history last see?
+            # A restart in the middle of an outage must still know the host
+            # HAD cards, or the loss indicator would vanish with the restart.
+            try:
+                from backend.db.repos import gpu_samples as _gs_repo
+                with LOCK:
+                    seen = _gs_repo.last_seen(name, conn=DB) or {}
+                _GPU_LAST_CARDS[name] = max(seen.values()) if seen else 0
+            except Exception:
+                _GPU_LAST_CARDS[name] = 0
+        if cards:
+            _GPU_LAST_CARDS[name] = int(time.time())
+            _GPU_LAST_NAMES[name] = {c.get("idx"): c.get("name") for c in cards if c.get("name")}
+
+def gpu_last_names(name):
+    """{idx: card name} as last reported by `name`; {} when never seen."""
+    with _GPU_LAST_CARDS_LOCK:
+        return dict(_GPU_LAST_NAMES.get(name) or {})
+
+def gpu_telemetry(name, hostd):
+    """The GPU-telemetry verdict for one host's latest data:
+
+        None                      — nothing to say: cards present, or a box
+                                    that never had any
+        {"ok": False, "error": …, "lost_since": ts|None}
+                                  — cards are missing where there should be
+                                    some. `error` is the probe's own diagnosis
+                                    (nvidia-smi's first line) when it has one;
+                                    `lost_since` is when the host last reported
+                                    a card, None if only the error is known.
+
+    Both the fleet rows and the GPU cockpit read this, so the host pill, the
+    fleet table, the host tile and the GPU tab can never disagree about whether
+    a host's GPUs are being watched."""
+    hostd = hostd or {}
+    if hostd.get("gpus"):
+        return None
+    err = hostd.get("gpu_error") or None
+    with _GPU_LAST_CARDS_LOCK:
+        last = _GPU_LAST_CARDS.get(name) or 0
+    lost = last if (last and int(time.time()) - last < GPU_LOST_FORGET_S) else None
+    if not err and not lost:
+        return None
+    return {"ok": False, "error": err, "lost_since": lost}
+
+def fleet_gpu_cards():
+    """[(host, cards, online)] for every host the hub holds data for — the hub
+    itself, then every remote with at least one successful poll.
+
+    One accessor so the alert scan doesn't need to know that the hub keeps its
+    cards in LATEST while remotes keep theirs in HOST_DATA. Offline hosts are
+    included with online=False so the caller can decide — a stale reading must
+    not be alerted on as if it were current.
+
+    Hosts whose latest poll carries NO cards are included too (with an empty
+    list). They used to be dropped, which meant a host losing ALL its cards at
+    once — exactly what a broken driver does — vanished from the scan entirely
+    and never raised the "stopped reporting" alert that losing ONE card would
+    have. The missing-card check needs to see the empty list to notice."""
+    out = [("local", list(LATEST.get("gpus") or []), True)]
+    with HOST_DATA_LOCK:
+        items = list(HOST_DATA.items())
+    for name, entry in items:
+        if "data" not in entry:
+            continue
+        cards = ((entry["data"].get("host") or {}).get("gpus")) or []
+        out.append((name, list(cards), _host_is_online(entry)))
+    return out
+
+def fleet_gpu_errors():
+    """{host: nvidia-smi's own diagnosis} for every host whose latest data
+    carries a gpu_error — the text the notifier puts in the alert body."""
+    out = {}
+    if LATEST.get("gpu_error"):
+        out["local"] = LATEST["gpu_error"]
+    with HOST_DATA_LOCK:
+        items = list(HOST_DATA.items())
+    for name, entry in items:
+        err = ((entry.get("data") or {}).get("host") or {}).get("gpu_error")
+        if err:
+            out[name] = err
+    return out
+
+def _record_host_sample(name, hostd):
+    """Persist one poll's vitals into host_samples(+_1h) — the storage that the
+    per-host Costs view (and future per-host history charts) integrate over.
+    Absent sensors stay NULL (no GPU ≠ zero watts). Runs on the poller's worker
+    threads, so the write takes LOCK on its own — never nest under
+    HOST_DATA_LOCK. A storage failure must not break the poll itself.
+
+    Also stores the host's per-card GPU history and per-service VRAM into the
+    same tables the hub uses for itself (keyed by host name), which is what lets
+    the GPU cockpit render a remote and the hub through one code path instead of
+    a charts-here / snapshot-there fork."""
+    from backend.db.repos import host_samples as _hs_repo
+    from backend.db.repos import gpu_samples as _gs_repo
+    gpu = hostd.get("gpu") or {}
+    cards = hostd.get("gpus") or []
+    ts = int(time.time())
+    try:
+        with LOCK:
+            _hs_repo.record(
+                DB, ts, name,
+                cpu=hostd.get("cpu"), ram_used=hostd.get("ram_used"),
+                ram_total=hostd.get("ram_total"), load1=hostd.get("load1"),
+                ctemp=hostd.get("ctemp"),
+                gpu_util=gpu.get("util"), gpu_mem_used=gpu.get("mem_used"),
+                gpu_mem_total=gpu.get("mem_total"), gpu_power=gpu.get("power"),
+                gpu_temp=gpu.get("temp"),
+                cpu_power=hostd.get("cpu_power"), dram_power=hostd.get("dram_power"))
+            if cards:
+                _gs_repo.record(DB, ts, name, cards, interval=INTERVAL)
+            rows = _host_vram_rows(ts, name, hostd)
+            if rows:
+                DB.executemany("INSERT INTO proc(ts,service,mem,host) VALUES(?,?,?,?)", rows)
+            DB.commit()
+    except Exception as e:
+        print(f"host sample store error ({name}):", e, flush=True)
+
+def _host_vram_rows(ts, name, hostd):
+    """One (ts, service, mem, host) row per service holding VRAM on `name`.
+
+    Prefers the container attribution the probe already computes (it maps each
+    compute pid through /proc/<pid>/cgroup, so `ollama` reads as the container
+    name a human recognises) and falls back to the bare process name for VRAM
+    held outside a container. Returns [] when the host reports no GPU processes
+    — better an honest gap in the chart than a row of zeros."""
+    procs = hostd.get("gpu_procs") or []
+    if not procs:
+        return []
+    by_svc, claimed = {}, 0
+    for c in ((hostd.get("docker") or {}).get("containers") or []):
+        mb = c.get("vram_mb") or 0
+        if mb > 0 and c.get("name"):
+            by_svc[c["name"]] = by_svc.get(c["name"], 0) + mb
+            claimed += mb
+    # Whatever the containers didn't account for is running on the host itself;
+    # attribute it by process name so it is visible rather than silently lost.
+    total = sum((p.get("mem") or 0) for p in procs)
+    if total - claimed > 0:
+        for p in sorted(procs, key=lambda x: -(x.get("mem") or 0)):
+            if claimed >= total:
+                break
+            take = min(p.get("mem") or 0, total - claimed)
+            if take > 0:
+                nm = "host:" + str(p.get("name") or "?")
+                by_svc[nm] = by_svc.get(nm, 0) + take
+                claimed += take
+    return [(ts, svc, mem, name) for svc, mem in by_svc.items()]
 
 # Phase 3.2: moved to backend/collectors/ — re-exported for backward compat
 from backend.collectors import host_poller
@@ -3803,6 +4514,25 @@ SETTING_DEFAULTS = {
     "webhook_url":         "",
     "alert_min_level":     "warning",  # "warning" or "critical"
     "disk_alert_pct":      "90",       # disk usage % that trips an alert
+    # ── GPU thermal / throttle alerting (the GPU cockpit) ─────────────────────
+    # Every threshold is paired with a SUSTAIN window, because the whole
+    # difference between a useful GPU alert and a noisy one is duration: a card
+    # touching 85 °C for two seconds mid-batch is not an incident, and a tool
+    # that pages for it gets muted within a week.
+    "gpu_temp_alert_c":      "84",     # per-card temperature that trips an alert
+    "gpu_temp_sustain_s":    "180",    # ...only after this many seconds above it
+    "gpu_throttle_sustain_s": "120",   # thermal throttling sustained this long
+    "gpu_vram_alert_pct":    "95",     # per-card VRAM %
+    "gpu_vram_sustain_s":    "300",
+    "gpu_fanstall_alerts":   "1",      # fan reading 0% on a warm card that HAS a fan
+    "gpu_missing_alerts":    "1",      # a card that was reporting stops reporting
+    "gpu_idle_watts":        "",       # blank = off; W drawn while idle before warning
+    "gpu_idle_sustain_s":    "1800",
+    # Per-host temperature overrides as JSON {"host": celsius}. Needed, not
+    # optional: a box whose cards run at a deliberately lowered power limit
+    # lives in the low-to-mid 80s by design, and a single global threshold
+    # would cry wolf there while being too slack for a well-cooled machine.
+    "gpu_temp_overrides":    "",
     "kwh_price":           "",         # electricity price per kWh (day/peak in dual mode); empty hides the cost card (#25)
     "currency":            "$",        # symbol shown next to costs
     # ── dual (day/night) tariff — revamp ──────────────────────────────────────
@@ -3824,6 +4554,29 @@ SETTING_DEFAULTS = {
     # ── Public status page (#217 follow-up) — Settings-driven toggle so it
     # doesn't require an env-var restart to turn on/off ─────────────────────
     "public_status_enabled": "0",     # "0" / "1"
+    # ── Custom AI servers ──────────────────────────────────────────────────
+    # User-registered model servers at an arbitrary host:port (JSON array of
+    # {"name","host","port","provider"}). Auto-discovery only covers the hub's
+    # containers on standard ports and remotes' localhost ollama, so a vLLM
+    # living on another box at a non-standard port needs this to show up.
+    "custom_ai_servers":   "",
+    # ── Home shortcuts (the Overview launchpad) ────────────────────────────
+    # The apps pinned on the Overview: a JSON array of
+    # {"name","url","icon","group","host","container"}. Stored server-side on
+    # purpose — pinned on the laptop, there on the phone and the wall screen.
+    "home_shortcuts":      "",
+    # ── Display preferences ────────────────────────────────────────────────
+    "reduced_motion":       "0",      # "0" (default, matches prior behaviour) / "1" — disables gauge animations
+    # Screen-refresh cadence (seconds) for the GPU tab + Overview cockpit "now"
+    # numbers — see FAST_INTERVAL/get_fast_interval(). Defaults to whatever the
+    # FAST_INTERVAL env var resolved to at startup; live-adjustable from here
+    # with no restart, but never faster than that startup value ever allowed
+    # (fast_sampler() only runs at all when FAST_INTERVAL started non-zero).
+    "fast_interval_s":     str(FAST_INTERVAL),
+    # ── App icons (#icons) — the selfh.st set, fetched by the hub and cached
+    # under the data volume. The browser only ever talks to this hub; see
+    # backend/icons.py. "0" falls back to the ~65 marks bundled in the page.
+    "icon_pack":           "1",      # "0" / "1"
 }
 SETTING_SECRETS = {"discord_webhook_url", "telegram_token", "email_password", "slack_webhook_url", "webhook_url", "api_key", "mlflow_token"}   # never round-tripped to the UI in full
 
@@ -3928,6 +4681,38 @@ def get_retention_secs():
         days = _RETENTION_DAYS_DEFAULT
     return days * 86400
 
+def get_fast_interval():
+    """Effective fast-lane cadence in seconds — the screen-refresh rate behind
+    the GPU tab and the Overview cockpit's "now" numbers. Read live from
+    settings, same pattern as get_retention_secs(), so a change in
+    Settings -> General takes effect on fast_sampler()'s next cycle with no
+    restart. Pinned to 0 when the fast lane was disabled at startup
+    (FAST_INTERVAL env var) since that loop never runs regardless of the
+    setting."""
+    if not FAST_INTERVAL:
+        return 0
+    try:
+        secs = int(get_settings().get("fast_interval_s") or FAST_INTERVAL)
+    except (ValueError, TypeError):
+        secs = FAST_INTERVAL
+    secs = max(1, min(secs, 30))
+    return secs if secs < INTERVAL else FAST_INTERVAL
+
+def _validate_fast_interval_settings(updates):
+    """Return an error string if fast_interval_s is invalid, else None."""
+    if "fast_interval_s" not in updates:
+        return None
+    val = (updates["fast_interval_s"] or "").strip()
+    if not val:
+        return None
+    try:
+        secs = int(val)
+    except ValueError:
+        return "Live refresh interval must be a whole number of seconds."
+    if not (1 <= secs <= 30):
+        return "Live refresh interval must be between 1 and 30 seconds."
+    return None
+
 def _validate_retention_settings(updates):
     """Return an error string if retention_days is invalid, else None."""
     if "retention_days" not in updates:
@@ -3942,6 +4727,72 @@ def _validate_retention_settings(updates):
     if days < 1 or days > 3650:
         return "Retention days must be between 1 and 3650."
     return None
+
+def _validate_gpu_alert_settings(updates):
+    """Reject malformed GPU alert thresholds before they reach the store.
+
+    The per-host override field takes JSON typed by a human, so it is validated
+    at the door rather than being tolerated at read time: a silently-ignored
+    malformed override means the user believes a host has a raised threshold
+    when it does not, and finds out via a 3am page.
+    """
+    if "gpu_temp_overrides" in updates:
+        raw = (updates["gpu_temp_overrides"] or "").strip()
+        if raw:
+            try:
+                over = json.loads(raw)
+            except ValueError:
+                return "Per-host GPU temperature overrides must be JSON, e.g. {\"vader\": 88}."
+            if not isinstance(over, dict):
+                return "Per-host GPU temperature overrides must be a JSON object of host → °C."
+            for host, val in over.items():
+                if not isinstance(host, str) or not host:
+                    return "Each GPU temperature override needs a host name."
+                try:
+                    c = int(val)
+                except (TypeError, ValueError):
+                    return f"GPU temperature override for '{host}' must be a whole number of °C."
+                if not (50 <= c <= 110):
+                    return f"GPU temperature override for '{host}' must be between 50 and 110 °C."
+    for key, lo, hi, what in (("gpu_temp_alert_c", 50, 110, "GPU temperature alert"),
+                              ("gpu_vram_alert_pct", 50, 100, "GPU VRAM alert"),
+                              ("gpu_temp_sustain_s", 0, 3600, "GPU temperature sustain"),
+                              ("gpu_throttle_sustain_s", 0, 3600, "GPU throttle sustain"),
+                              ("gpu_vram_sustain_s", 0, 3600, "GPU VRAM sustain"),
+                              ("gpu_idle_sustain_s", 0, 86400, "GPU idle sustain")):
+        if key not in updates:
+            continue
+        val = (updates[key] or "").strip()
+        if not val:
+            continue
+        try:
+            n = int(val)
+        except ValueError:
+            return f"{what} must be a whole number."
+        if not (lo <= n <= hi):
+            return f"{what} must be between {lo} and {hi}."
+    return None
+
+def _validate_custom_ai_servers(updates):
+    """Return an error string if custom_ai_servers is malformed, else None.
+
+    Same door-vs-read discipline as the GPU temperature overrides: a silently
+    dropped entry would read as "the server is just down" for the rest of the
+    user's life with this dashboard. Empty value is allowed (it clears the
+    list). The heavy lifting is pure (validate_custom_servers in
+    backend/probes) so it is unit-testable without importing this module."""
+    if "custom_ai_servers" not in updates:
+        return None
+    return validate_custom_servers(updates["custom_ai_servers"])
+
+def _validate_home_shortcuts(updates):
+    """Return an error string if home_shortcuts is malformed, else None. Same
+    door-vs-read discipline as the custom AI servers: the value comes back to
+    every browser that opens this hub, so a bad URL is rejected here rather
+    than rendered as an <a href> later."""
+    if "home_shortcuts" not in updates:
+        return None
+    return validate_shortcuts(updates["home_shortcuts"])
 
 # ── Uptime checks: HTTP/TCP endpoint monitors ──────────────────────────────
 # User-defined HTTP/TCP endpoint monitors, probed from inside the container on a
@@ -4252,7 +5103,8 @@ def _uptime_state(check_id, now, window=86400, window2=604800):
     uptime% over `window` (24h) and `window2` (7d), last_checked, last_err, and a
     coarse heartbeat strip. Caller must NOT hold LOCK (this takes it briefly)."""
     from backend.db.repos import uptime as _uptime_repo
-    since, since2 = now - window, now - window2
+    since = 0 if window is None else now - window
+    since2 = now - window2
     with LOCK:
         rows = _uptime_repo.results_since_full(check_id, since, conn=DB)
         agg2 = _uptime_repo.results_window_agg(check_id, since2, conn=DB)
@@ -4745,6 +5597,38 @@ def smi(args):
     # instead of stalling host metrics (CPU/RAM/temp) for the full window.
     return subprocess.run(["nvidia-smi", *args], capture_output=True, text=True, timeout=3).stdout.strip()
 
+def nvidia_failure():
+    """Why nvidia-smi answered nothing, on a box that evidently HAS an NVIDIA
+    stack — None when there is simply no NVIDIA driver here at all. Mirror of
+    probe._nvidia_failure() for the hub's own cards; the two must not drift.
+
+    The kernel driver leaves /proc/driver/nvidia and /dev/nvidiactl behind even
+    when nvidia-smi can no longer talk to it (userspace libraries updated, kernel
+    module not yet reloaded — "Driver/library version mismatch"), so those are
+    the tell that distinguishes "broken" from "absent". The container shares the
+    host's /proc (pid: host), so this sees the host's driver even from inside.
+    The message is the tool's own first line — what a human would see running
+    it by hand."""
+    have_bin = bool(shutil.which("nvidia-smi"))
+    have_drv = (os.path.exists("/proc/driver/nvidia") or os.path.exists("/dev/nvidiactl")
+                or bool(glob.glob("/dev/nvidia[0-9]*")))
+    if not have_bin and not have_drv:
+        return None
+    if not have_bin:
+        return ("NVIDIA kernel driver is loaded but nvidia-smi is not available in this "
+                "container (start the hub with docker-compose.gpu.yml)")
+    try:
+        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=3)
+    except subprocess.TimeoutExpired:
+        return "nvidia-smi timed out after 3 s (wedged driver / card off the bus?)"
+    except Exception as e:
+        return f"nvidia-smi could not be run: {e}"
+    if r.returncode == 0 and (r.stdout or "").strip():
+        return None
+    text = (r.stderr or "") + "\n" + (r.stdout or "")
+    line = next((l.strip() for l in text.splitlines() if l.strip()), "") or "no output"
+    return f"nvidia-smi failed (exit {r.returncode}): {line[:200]}"
+
 def _gpu_num(x):
     """Tolerant float for nvidia-smi CSV fields: '[N/A]' / '[Not Supported]' /
     blank → 0.0 instead of raising, so one unreadable field (power/temp) never
@@ -4753,6 +5637,37 @@ def _gpu_num(x):
         return float((x or "").strip())
     except ValueError:
         return 0.0
+
+def _smi_uuid_idx():
+    """GPU UUID → card index. `--query-compute-apps` identifies a process's card
+    by UUID and never by index, so this map is the only way to answer "which card
+    is this process on". {} when unavailable — attribution then stays pooled, as
+    it was before per-card support. Mirrors probe._nvidia_uuid_idx."""
+    out = {}
+    try:
+        for line in smi(["--query-gpu=index,uuid", "--format=csv,noheader,nounits"]).splitlines():
+            p = [x.strip() for x in line.split(",")]
+            if len(p) >= 2 and p[1]:
+                out[p[1]] = int(_gpu_num(p[0]))
+    except Exception:
+        pass
+    return out
+
+def _gpu_opt(x):
+    """Like _gpu_num, but an unsupported field stays None instead of becoming 0.
+
+    Use this for any metric where "the card can't tell us" and "the measured
+    value is zero" are different claims a human would act on differently — fan
+    speed being the sharp case: 0% means a stalled fan, absent means a passively
+    cooled card. The cockpit renders the two differently and never alerts on the
+    second. Mirrors probe._smi_opt."""
+    s = (x or "").strip()
+    if not s or s.startswith("["):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 # ── AMD GPU back-end (issue #1) ───────────────────────────────────────────────
 # NVIDIA goes through nvidia-smi (above); AMD has no universally-present CLI, so we
@@ -4790,6 +5705,72 @@ def _amd_hwmon(dev, fname):
     except OSError:
         pass
     return None
+
+_PCI_IDS_PATHS = ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids")
+_AMD_PCI_NAMES = None      # device-id -> pci.ids device name for vendor 0x1002, lazy
+
+def _amd_pci_names():
+    """The pci.ids device table for vendor 0x1002, parsed once and cached.
+
+    The slim image ships no pci.ids, but the host's copy is visible through the
+    HOST_ROOT bind mount (Fedora/Arch keep it in /usr/share/hwdata, Debian/Ubuntu
+    in /usr/share/misc). {} when neither file is readable — callers fall back."""
+    global _AMD_PCI_NAMES
+    if _AMD_PCI_NAMES is not None:
+        return _AMD_PCI_NAMES
+    complete_empty = False
+    for p in _PCI_IDS_PATHS:
+        names = {}
+        try:
+            with open(_hp(p), encoding="utf-8", errors="replace") as f:
+                in_amd = False
+                for line in f:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    if not line.startswith("\t"):          # vendor row
+                        in_amd = line[:4].lower() == "1002"
+                    elif in_amd and not line.startswith("\t\t"):   # device row
+                        did, _, name = line.strip().partition("  ")
+                        if re.fullmatch(r"[0-9a-fA-F]{4}", did) and name:
+                            names[did.lower()] = name.strip()
+                    elif in_amd is False and names:
+                        break                              # left the AMD block
+        except OSError:
+            continue        # unreadable, or died mid-file — discard the partial parse
+        if names:
+            _AMD_PCI_NAMES = names
+            return names
+        complete_empty = True
+    # Cache decides by what happened: a file we consumed to the end but that had
+    # no AMD block won't grow one — cache the empty table rather than re-parsing
+    # the whole file per card per tick. No file readable at all stays uncached:
+    # a bind mount added later (or a package install) should be picked up, and
+    # the retry is just two failed opens.
+    if complete_empty:
+        _AMD_PCI_NAMES = {}
+    return {}
+
+def _amd_pci_name(dev):
+    """Card name from pci.ids for kernels that expose no product_name (every APU,
+    e.g. Strix Halo). None when the device id is unknown — the caller keeps its
+    'AMD GPU <n>' fallback.
+
+    pci.ids writes AMD entries as 'Codename [Retail Name / Retail Name / …]'. The
+    bracket is used when it names exactly one retail product; when it lists several
+    variants sharing the silicon (Strix Halo covers 8050S and 8060S) we can't tell
+    which one this host has, so the codename is the honest label."""
+    try:
+        with open(os.path.join(dev, "device")) as f:
+            did = f.read().strip().lower()
+    except OSError:
+        return None
+    raw = _amd_pci_names().get(did[2:] if did.startswith("0x") else did)
+    if not raw:
+        return None
+    m = re.fullmatch(r"(.+?)\s*\[(.+)\]", raw)
+    if m:
+        raw = m.group(1).strip() if "/" in m.group(2) else m.group(2).strip()
+    return raw if raw.upper().startswith("AMD") else "AMD " + raw
 
 def amd_gpus(drm_root=None):
     """Per-card AMD snapshot from amdgpu sysfs, matching the dict shape sample_once()
@@ -4839,6 +5820,8 @@ def amd_gpus(drm_root=None):
                 name = f.read().strip() or None
         except OSError:
             pass
+        if not name:
+            name = _amd_pci_name(dev)     # pci.ids via HOST_ROOT; None when unknown
         # PCI address of the card (cardN/device is a symlink into /sys/devices/pci…):
         # lets per-process fdinfo attribution match its drm-pdev to *this* card, so a
         # hybrid APU + discrete-AMD host counts GTT only for the APU. None when the
@@ -4847,7 +5830,7 @@ def amd_gpus(drm_root=None):
         pdev = os.path.basename(os.path.realpath(dev))
         if not re.fullmatch(r"[0-9a-fA-F]{4,}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", pdev):
             pdev = None
-        gpus.append({
+        g = {
             "idx": int(m.group(1)),
             "name": name or "AMD GPU %s" % m.group(1),
             "util": float(busy) if busy is not None else 0.0,
@@ -4857,75 +5840,244 @@ def amd_gpus(drm_root=None):
             "temp":  round(temp_m / 1000.0, 1) if temp_m is not None else 0.0,
             "unified": unified,   # APU/GTT mode — per-process attribution counts GTT too
             "pdev": pdev,
-        })
+        }
+        # Fan: pwm1 is the duty cycle 0-255, fan1_input the tachometer in RPM.
+        # Both stay absent on a card with no fan node (passively cooled, or a
+        # laptop where the EC owns the fan) rather than reading as a stalled fan.
+        pwm = _amd_hwmon(dev, "pwm1")
+        if pwm is not None:
+            g["fan"] = round(pwm * 100.0 / 255.0)
+        rpm = _amd_hwmon(dev, "fan1_input")
+        if rpm is not None:
+            g["fan_rpm"] = rpm
+        _amd_enrich_card(g, dev)   # clocks/perf level/cap — here, while dev is known
+        gpus.append(g)
     return gpus
 
-def _fdinfo_kib(v):
-    """DRM fdinfo memory value ('123 KiB', '4 MiB') → KiB. amdgpu prints KiB, but
-    parse the unit defensively rather than assuming."""
-    p = v.split()
+_PP_DPM_CUR = re.compile(r":\s*(\d+)\s*[Mm][Hh]z\s*\*")   # the row the driver stars
+
+def _amd_dpm_mhz(dev, fname):
+    """Current clock in MHz from a pp_dpm_* table ('1: 1100Mhz *' — the starred row
+    is the active level). None when the file is absent or nothing is starred."""
     try:
-        n = float(p[0])
-    except (ValueError, IndexError):
-        return 0.0
-    return n * {"KiB": 1.0, "MiB": 1024.0, "GiB": 1048576.0}.get(p[1] if len(p) > 1 else "KiB", 1.0)
+        with open(os.path.join(dev, fname)) as f:
+            for line in f:
+                m = _PP_DPM_CUR.search(line)
+                if m:
+                    return int(m.group(1))
+    except OSError:
+        pass
+    return None
+
+def _amd_hwmon_labeled(dev, prefix, label):
+    """Value of the hwmon channel whose <prefix>N_label matches `label` (e.g. the
+    temp channel labelled 'mem'), or None. Channel numbers are not stable across
+    cards/drivers, so matching by label is the only reliable way."""
+    try:
+        for h in sorted(os.listdir(os.path.join(dev, "hwmon"))):
+            hdir = os.path.join(dev, "hwmon", h)
+            try:
+                entries = sorted(os.listdir(hdir))
+            except OSError:
+                continue
+            for e in entries:
+                if e.startswith(prefix) and e.endswith("_label"):
+                    try:
+                        with open(os.path.join(hdir, e)) as f:
+                            if f.read().strip() != label:
+                                continue
+                    except OSError:
+                        continue
+                    v = _amd_read_int(os.path.join(hdir, e[:-6] + "_input"))
+                    if v is not None:      # unreadable input: keep scanning — another
+                        return v           # hwmon dir may carry the same label
+    except OSError:
+        pass
+    return None
+
+def _amd_hwmon_has(dev, fname):
+    """Whether any of the card's hwmon dirs contains `fname`."""
+    try:
+        for h in sorted(os.listdir(os.path.join(dev, "hwmon"))):
+            if os.path.exists(os.path.join(dev, "hwmon", h, fname)):
+                return True
+    except OSError:
+        pass
+    return False
+
+def _amd_enrich_card(g, dev):
+    """Best-effort AMD counterpart of _enrich_gpus: attach mem_util/clk_sm/clk_mem/
+    power_limit/pstate/temp_mem to one card dict, from amdgpu sysfs instead of
+    nvidia-smi. Mutates in place; an absent node leaves its field unset, so the
+    same UI chips that hide on an NVIDIA '[N/A]' stay hidden here too.
+
+    Runs inside amd_gpus' per-card loop rather than as a separate collector pass:
+    the collector re-indexes AMD cards above the NVIDIA range (gpu_samples.idx must
+    not collide), so after that point idx no longer names the sysfs cardN and the
+    dev path here is the only reliable handle. Unlike the NVIDIA enrichment (extra
+    nvidia-smi round-trips, kept out of the base query), these are a handful of
+    sysfs reads on the card we're already visiting.
+
+    What each card offers varies: discrete cards have mem_busy_percent, a power cap
+    and a 'mem' temp channel; APUs (Strix Halo) have none of those but do publish
+    the pp_dpm_* clock tables and the hwmon sclk frequency. Everything is optional
+    and read independently."""
+    clk = _amd_dpm_mhz(dev, "pp_dpm_sclk")
+    if clk is None:
+        # hwmon fallback, by label like everything else here: freq1 is usually
+        # sclk but nothing guarantees the ordering. A bare freq1_input is trusted
+        # only when the channel is unlabelled (very old kernels).
+        hz = _amd_hwmon_labeled(dev, "freq", "sclk")
+        if hz is None and not _amd_hwmon_has(dev, "freq1_label"):
+            hz = _amd_hwmon(dev, "freq1_input")        # Hz
+        clk = round(hz / 1e6) if hz else None
+    if clk is not None:
+        g["clk_sm"] = clk
+    mclk = _amd_dpm_mhz(dev, "pp_dpm_mclk")
+    if mclk is not None:
+        g["clk_mem"] = mclk
+    mbusy = _amd_read_int(os.path.join(dev, "mem_busy_percent"))
+    if mbusy is not None:
+        g["mem_util"] = mbusy
+    cap = _amd_hwmon(dev, "power1_cap")                # microwatts
+    if cap:
+        g["power_limit"] = round(cap / 1e6, 1)
+    lvl = _rt(os.path.join(dev, "power_dpm_force_performance_level"))
+    if lvl and lvl.strip():
+        g["pstate"] = lvl.strip()                      # auto / low / high / manual
+    tmem = _amd_hwmon_labeled(dev, "temp", "mem")      # millidegrees C
+    if tmem:
+        g["temp_mem"] = round(tmem / 1000.0, 1)
+
+_DRM_UNITS = {"": 1, "KiB": 1024, "MiB": 1048576, "GiB": 1073741824, "TiB": 1099511627776}
+_DRM_MAJOR = 226        # /dev/dri/* — char-major-226, Documentation/admin-guide/devices.txt
+
+def _fdinfo_bytes(val):
+    """DRM fdinfo memory value ('326612 KiB', '4 MiB') → bytes. 0 when the field is
+    absent or malformed.
+
+    A bare number is BYTES, not KiB: the kernel's fdinfo formatter only scales up
+    while the value divides evenly by 1024, so anything unaligned prints raw — which
+    is also why a zero shows up as a plain '0' and never '0 KiB'. An unrecognised
+    unit yields 0 rather than a figure that could be off by a factor of 1024."""
+    parts = (val or "").split()
+    try:
+        n = int(parts[0])
+    except (IndexError, ValueError):
+        return 0
+    return n * _DRM_UNITS.get(parts[1] if len(parts) > 1 else "", 0)
+
+def _fdinfo_region_bytes(f, region):
+    """Bytes one DRM client holds privately in <region> ('vram' or 'gtt').
+
+    drm-resident-* is the standardised key; kernels predating that standardisation
+    (6.1–6.14, including the 6.6 and 6.12 LTS lines) publish the same figure as
+    drm-memory-*, and drm-total-* is its printed alias — so both are fallbacks.
+    Without them attribution silently reports nothing on those kernels.
+
+    Selection is by key PRESENCE, not truthiness: drm-resident-* can legitimately
+    say 0 (an evicted allocation) while drm-total-* stays nonzero, and falling
+    through on the zero would attribute non-resident memory as current residency.
+
+    drm-shared-* is subtracted: a buffer shared between two clients (a dma-buf
+    between an app and a compositor, say) is counted in the residency of BOTH, and
+    their client-ids differ so dedup can't catch it. Crediting it whole to each
+    would let per-service totals exceed the card's capacity; the shared remainder
+    stays in the chart's system/other bucket instead of being counted twice."""
+    resident = 0
+    for prefix in ("drm-resident-", "drm-memory-", "drm-total-"):
+        val = f.get(prefix + region)
+        if val is not None:
+            resident = _fdinfo_bytes(val)
+            break
+    return max(0, resident - _fdinfo_bytes(f.get("drm-shared-" + region)))
+
+def _drm_fd_rdev(proc_root, pid, fd):
+    """The fd's device number, or None when the stat isn't possible.
+
+    Identity is the device number, not the path: a container may map the render node
+    anywhere (--device=/dev/dri/renderD128:/dev/gpu0), and a path test would drop it
+    along with all of that container's attribution. None means "read fdinfo anyway"
+    — a process in another user namespace (rootless podman) denies the stat while
+    still allowing fdinfo, and that container is often the one holding all the
+    VRAM."""
+    try:
+        st = os.stat(os.path.join(proc_root, pid, "fd", fd))
+    except OSError:
+        return None
+    return st.st_rdev                              # 0 for anything but a device
 
 def amd_fdinfo_procs(proc_root="/proc"):
     """Per-PID AMD GPU memory from DRM fdinfo — the amdgpu counterpart of
     `nvidia-smi --query-compute-apps`, which AMD has no equivalent of without ROCm
     tools (and this project's AMD back-end is deliberately sysfs-only, issue #1).
-    Any process holding the GPU has /proc/<pid>/fd/N → /dev/dri/* and a matching
-    fdinfo file with `drm-driver: amdgpu` + `drm-memory-vram/gtt` lines (kernel
-    5.19+; older kernels lack the drm-memory-* keys and yield {}). Returns
-    {pid: {pdev: {"vram": MB, "gtt": MB}}} — split per PCI device (pdev may be
-    None on kernels that omit drm-pdev) so the caller can apply the APU-vs-
-    discrete GTT policy per card, not host-wide. A dup'd/inherited fd shares its
-    DRM client (same drm-client-id) with the original — counting both would
-    double the client's buffers — so clients are counted once per
-    (pdev, client-id). Reads the hub's own /proc: the hub runs in the host PID
-    namespace, so host pids and their fds are visible (same access
-    service_for_pid relies on)."""
+    Any process holding the GPU has /proc/<pid>/fd/N → a char-major-226 device and
+    a matching fdinfo file with `drm-driver: amdgpu` plus per-region residency keys
+    (drm-resident-*, or drm-memory-*/drm-total-* on older kernels; pre-5.19 kernels
+    have none and yield {}). Returns {pid: {pdev: {"vram": MB, "gtt": MB}}} — split
+    per PCI device (pdev may be None on kernels that omit drm-pdev) so the caller
+    can apply the APU-vs-discrete GTT policy per card, not host-wide.
+
+    Clients are counted once per (device, client-id) GLOBALLY, not per pid: dup()'d
+    fds, threads and forked children all republish the same DRM client, and a
+    supervisor keeping an inherited fd open would otherwise double the worker's
+    buffers across two services. Pids scan lowest-first so such a client is always
+    credited to the same process — with readdir order the owner would flip between
+    samples and the per-service history would sawtooth. Client-ids are recycled, so
+    in the rare case where one is freed and reissued mid-scan we drop the second
+    sighting — one sample's worth of memory, self-correcting on the next.
+
+    Reads the hub's own /proc: the hub runs in the host PID namespace, so host pids
+    and their fds are visible (same access service_for_pid relies on)."""
     out = {}
     try:
         pids = [p for p in os.listdir(proc_root) if p.isdigit()]
     except OSError:
         return {}
-    for pid in pids:
+    seen = set()       # (device, client-id) already counted, across ALL pids
+    for pid in sorted(pids, key=int):
         fddir = os.path.join(proc_root, pid, "fd")
         try:
             fds = os.listdir(fddir)
         except OSError:
             continue   # process vanished, or fd table not readable
-        seen = set()   # (pdev, client-id) already counted for this pid
-        devs = {}      # pdev -> [vram KiB, gtt KiB]
+        devs = {}      # pdev -> [vram bytes, gtt bytes]
         for fd in fds:
+            rdev = _drm_fd_rdev(proc_root, pid, fd)
+            if rdev is not None and os.major(rdev) != _DRM_MAJOR:
+                continue                       # cheap reject; None = read fdinfo anyway
             try:
-                if not os.readlink(os.path.join(fddir, fd)).startswith("/dev/dri/"):
-                    continue
                 with open(os.path.join(proc_root, pid, "fdinfo", fd)) as f:
-                    txt = f.read(8192)
+                    txt = f.read(8192)     # the drm-* block sits well inside this
             except OSError:
                 continue
-            drv = client = pdev = None
-            fv = fg = 0.0
-            for line in txt.splitlines():
-                k, _, val = line.partition(":")
-                val = val.strip()
-                if   k == "drm-driver":    drv = val
-                elif k == "drm-client-id": client = val
-                elif k == "drm-pdev":      pdev = val
-                # legacy + current key names for the same totals; equal when both present
-                elif k in ("drm-memory-vram", "drm-total-vram"): fv = _fdinfo_kib(val)
-                elif k in ("drm-memory-gtt",  "drm-total-gtt"):  fg = _fdinfo_kib(val)
-            if drv != "amdgpu" or client is None or (pdev, client) in seen:
+            if "drm-driver" not in txt:
                 continue
-            seen.add((pdev, client))
-            if fv or fg:
-                d = devs.setdefault(pdev, [0.0, 0.0])
-                d[0] += fv
-                d[1] += fg
+            fields = {}
+            for line in txt.splitlines():
+                k, sep, val = line.partition(":")
+                if sep and k.startswith("drm-"):
+                    fields[k.strip()] = val.strip()
+            client = fields.get("drm-client-id")
+            pdev = fields.get("drm-pdev")
+            # Dedup device identity: pdev when the kernel names it; else the fd's
+            # device number (client-ids are per-device counters, so two pdev-less
+            # cards can carry the same id — collapsing them would drop one); else
+            # the pid, which narrows dedup to upstream's per-pid semantics rather
+            # than ever dropping a client.
+            dev_id = pdev if pdev is not None else (rdev if rdev is not None else pid)
+            if (fields.get("drm-driver") != "amdgpu" or client is None
+                    or (dev_id, client) in seen):
+                continue
+            seen.add((dev_id, client))
+            vb = _fdinfo_region_bytes(fields, "vram")
+            gb = _fdinfo_region_bytes(fields, "gtt")
+            if vb or gb:
+                d = devs.setdefault(pdev, [0, 0])
+                d[0] += vb
+                d[1] += gb
         if devs:
-            out[int(pid)] = {pdev: {"vram": v / 1024.0, "gtt": g / 1024.0}
+            out[int(pid)] = {pdev: {"vram": v / 1048576.0, "gtt": g / 1048576.0}
                              for pdev, (v, g) in devs.items()}
     return out
 
@@ -4961,14 +6113,26 @@ _THROTTLE_BITS = [
     (0x0000000000000080, "Power brake"),  # HW_POWER_BRAKE_SLOWDOWN — external power brake
 ]
 
+# The subset of _THROTTLE_BITS that means "too hot" rather than "at the power
+# cap". A card pinned at its power limit is working as configured (vader's 3090s
+# run that way by design); a card slowing down thermally is a problem. The alert
+# rules treat the two differently, so the distinction lives here, once.
+_THERMAL_BITS = 0x0000000000000068   # SW thermal | HW thermal | HW slowdown
+
 def _decode_throttle(hexstr):
     """nvidia-smi throttle bitmask → list of *meaningful* reasons. Idle / app-clocks
     / sync-boost / display bits are normal and intentionally ignored."""
+    return _decode_throttle_mask(hexstr)[1]
+
+def _decode_throttle_mask(hexstr):
+    """As _decode_throttle, but returns (mask, reasons) — the raw mask is what
+    gets stored per sample, so history can distinguish thermal throttling from
+    power-capping without re-deriving it from the label strings."""
     try:
         mask = int(str(hexstr).strip(), 16)
     except (TypeError, ValueError):
-        return []
-    return [label for bit, label in _THROTTLE_BITS if mask & bit]
+        return 0, []
+    return mask, [label for bit, label in _THROTTLE_BITS if mask & bit]
 
 def _enrich_gpus(gpus):
     """Best-effort: attach mem_util/clocks/power_limit/pstate/temp_mem and throttle
@@ -4984,12 +6148,22 @@ def _enrich_gpus(gpus):
             g = by_idx.get(int(_gpu_num(p[0])))
             if not g:
                 continue
-            g["mem_util"]    = _gpu_num(p[1])
-            g["clk_sm"]      = _gpu_num(p[2])
-            g["clk_mem"]     = _gpu_num(p[3])
-            g["power_limit"] = _gpu_num(p[4])
-            g["temp_mem"]    = _gpu_num(p[5])
-            g["pstate"]      = p[6] if (p[6] and not p[6].startswith("[")) else ""
+            # '[N/A]' must leave mem_util ABSENT, not 0: _gpu_extra averages only
+            # the cards that measured, and the UI hides the chip on absence — a
+            # coerced 0 would read as a confident "0% mem-bandwidth".
+            # Every one of these stays ABSENT when the card doesn't report it,
+            # never 0. _gpu_num would coerce '[N/A]' to 0.0, and the cockpit
+            # derives its per-card `supports` map from presence — a coerced zero
+            # advertises the metric as supported and then draws a confident flat
+            # line at zero. The remote probe's _nvidia_enrich already does this;
+            # the hub's own cards were the inconsistent half.
+            for key, raw in (("mem_util", p[1]), ("clk_sm", p[2]), ("clk_mem", p[3]),
+                             ("power_limit", p[4]), ("temp_mem", p[5])):
+                v = _gpu_opt(raw)
+                if v is not None:
+                    g[key] = v
+            if p[6] and not p[6].startswith("["):
+                g["pstate"] = p[6]
     except Exception:
         pass
     for field in ("clocks_throttle_reasons.active", "clocks_event_reasons.active"):
@@ -5005,8 +6179,10 @@ def _enrich_gpus(gpus):
             g = by_idx.get(int(_gpu_num(p[0])))
             if g is None:
                 continue
-            g["throttle"] = _decode_throttle(p[1])
-            g["throttled"] = bool(g["throttle"])
+            mask, reasons = _decode_throttle_mask(p[1])
+            g["throttle_mask"] = mask
+            g["throttle"] = reasons
+            g["throttled"] = bool(reasons)
             ok = True
         if ok:
             break
@@ -5017,16 +6193,36 @@ def _gpu_extra(gpus):
     if not gpus:
         return {}
     g0 = gpus[0]
-    return {
-        "mem_util":  round(sum(g.get("mem_util", 0) for g in gpus) / len(gpus)),
+    out = {
         "clk_sm":    round(g0.get("clk_sm", 0)),
         "clk_mem":   round(g0.get("clk_mem", 0)),
-        "power_limit": round(sum(g.get("power_limit", 0) for g in gpus)),
         "pstate":    g0.get("pstate", ""),
         "temp_mem":  round(max((g.get("temp_mem", 0) for g in gpus), default=0)),
         "throttled": any(g.get("throttled") for g in gpus),
         "throttle":  sorted({r for g in gpus for r in g.get("throttle", [])}),
     }
+    # The power chip divides the POOLED draw by this cap, so the cap is published
+    # only when every card contributed one: with a card of unknown cap (AMD APUs
+    # have no power1_cap, NVIDIA can say '[N/A]') the ratio would exceed 100%
+    # merely because the denominator is missing a card the numerator includes.
+    if all(g.get("power_limit", 0) > 0 for g in gpus):
+        out["power_limit"] = round(sum(g["power_limit"] for g in gpus))
+    # mem-bandwidth utilisation averaged over the cards that actually measured it:
+    # cards without the counter (AMD APUs have no mem_busy_percent, NVIDIA can say
+    # '[N/A]') must neither surface a fabricated 0% chip nor dilute a measured
+    # value — 0 measured and 0 unknown are different claims.
+    measured = [g["mem_util"] for g in gpus if "mem_util" in g]
+    if measured:
+        out["mem_util"] = round(sum(measured) / len(measured))
+    # Fan follows the same "only the cards that measured it" rule: a passively
+    # cooled card in the box must not pull the average toward a speed nothing
+    # reported. fan_max is what the cockpit shows — "is there headroom left?" is
+    # answered by the busiest fan, not by the mean.
+    fans = [g["fan"] for g in gpus if g.get("fan") is not None]
+    if fans:
+        out["fan"] = round(sum(fans) / len(fans))
+        out["fan_max"] = round(max(fans))
+    return out
 
 def service_for_pid(pid, nm):
     try:
@@ -5514,7 +6710,15 @@ def _fetch_model_registry():
 def _model_registry(now=None):
     """Cached registry accessor. Serves a fresh fetch at most once per _REGISTRY_TTL
     so a chatty UI can't hammer ollama. Returns (models, reachable). Network I/O
-    happens OUTSIDE the cache lock."""
+    happens OUTSIDE the cache lock.
+
+    Double-checked locking: after a cache-miss triggers a fetch, we re-check the
+    cache under the lock again before writing. Without this, a burst of concurrent
+    callers that all observe a stale cache at the same time each independently
+    fetch in parallel (N simultaneous HTTP round-trips to ollama), defeating the
+    TTL rate-limit on every cache expiry under load. With it, only the first
+    caller past the gate fetches; everyone else who raced in behind it gets the
+    winner's fresh result instead of triggering their own redundant fetch."""
     now = now or time.time()
     with _REGISTRY_LOCK:
         c = _REGISTRY_CACHE
@@ -5522,6 +6726,13 @@ def _model_registry(now=None):
             return list(c["models"]), c["reachable"]
     models, reachable = _fetch_model_registry()
     with _REGISTRY_LOCK:
+        c = _REGISTRY_CACHE
+        # Someone else may have already refreshed the cache while we were
+        # fetching (network I/O happens outside the lock, so this window is
+        # real). If so, defer to their result instead of overwriting it with
+        # our possibly-slightly-older one.
+        if c and (now - c["ts"]) < _REGISTRY_TTL:
+            return list(c["models"]), c["reachable"]
         globals()["_REGISTRY_CACHE"] = {
             "ts": now, "models": models, "reachable": reachable}
     return list(models), reachable
@@ -5539,21 +6750,41 @@ def _merge_registry(ollama_models, catalog):
     (name/provider/loaded/vram — no on-disk size, most catalogue APIs don't expose
     one). Entries missing a model name are skipped."""
     out = [dict(m, provider="ollama", host="local") for m in ollama_models]
-    seen = {(m["name"], m["provider"]) for m in out}
+    seen = {(m["name"], m["provider"], "local") for m in out}
+    hub = socket.gethostname()
     for c in catalog or []:
         name = c.get("model")
         provider = c.get("provider") or "other"
-        if not name or provider == "ollama":
+        chost = c.get("host") or "local"
+        if chost == hub:
+            chost = "local"
+        # The hub's OWN ollama is covered by the richer disk registry above, so
+        # its models dedupe against it by name (the `seen` check below). They
+        # are NOT dropped wholesale any more: the disk registry only ever talks
+        # to ONE ollama (COPILOT_OLLAMA_URL, 127.0.0.1:11434 by default), so a
+        # second ollama container on the hub — or the only one, listening on a
+        # non-default port — had every model silently missing from the
+        # Installed list while the panel above showed it loaded. A REMOTE
+        # host's ollama models arrive through this catalog and pass through
+        # the same way.
+        if not name:
             continue
-        key = (name, provider)
+        key = (name, provider, chost)
         if key in seen:
             continue
         seen.add(key)
+        size = c.get("size_bytes")
         out.append({
-            "name": name, "provider": provider, "host": "local",
-            "size_bytes": None, "size_gb": None, "family": None,
-            "param_size": None, "quant": None, "modified": None,
+            "name": name, "provider": provider, "host": chost,
+            "size_bytes": size,
+            "size_gb": round(size / 1073741824, 2) if size else None,
+            "family": c.get("family"), "param_size": c.get("param_size"),
+            "quant": c.get("quant"), "modified": c.get("modified"),
             "loaded": bool(c.get("loaded")), "vram_mb": c.get("vram_mb"),
+            # Links this row back to its serving telemetry (D.now.serving is
+            # keyed by service, not model name) — dropped here previously, which
+            # is why a box's own AI-models card could never look up its tok/s.
+            "service": c.get("service"),
         })
     return out
 
@@ -5776,6 +7007,70 @@ def _public_settings():
 
 _DISK_SCAN, _DISK_SCAN_LOCK = {}, threading.Lock()
 _DISK_SCAN_TTL = 900   # reuse a completed scan for 15 min
+_DISK_SCAN_TIMEOUT = 600
+# Two levels at once (folder + its sub-folders) so the treemap can nest. du
+# recurses fully whatever --max-depth says, so asking for depth 2 costs the same
+# as depth 1 and only prints more. --one-file-system keeps a scan of / from
+# wandering into every bind mount and network share on the box.
+_DU_ARGS = ["-b", "--max-depth=2", "--one-file-system"]
+
+def _disk_scan_key(host, path):
+    """Cache key. Keyed by host as well as path, or a scan of /var on one machine
+    would be served as a scan of /var on the next one you clicked."""
+    return ("local" if not host or host == "local" else host, path)
+
+def _safe_scan_path(path):
+    """Normalise a client-supplied absolute path, or None if it isn't one we are
+    willing to hand to a remote shell. Absolute, no '..' traversal, and no shell
+    metacharacters or control bytes — the value is shell-quoted at the call site
+    too, so this is the belt to that suspenders."""
+    if not path or not isinstance(path, str) or not path.startswith("/"):
+        return None
+    if "\x00" in path or any(ord(c) < 32 for c in path):
+        return None
+    norm = os.path.normpath(path)
+    if ".." in norm.split("/"):
+        return None
+    return norm
+
+def _parse_du(stdout, root, hostp=lambda p: p):
+    """Turn `du -b --max-depth=2` output into the nested {total, entries} the
+    treemap draws. Shared by the local and remote scanners so the two can't drift
+    into rendering the same filesystem differently."""
+    sizes = {}
+    for ln in (stdout or "").splitlines():
+        parts = ln.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            sizes[os.path.normpath(parts[1])] = int(parts[0])
+        except ValueError:
+            continue
+    root = os.path.normpath(root)
+    total = sizes.get(root, 0)
+    by_parent = {}
+    for p, b in sizes.items():
+        if p == root:
+            continue
+        by_parent.setdefault(os.path.dirname(p), []).append((p, b))
+    TOP_N, KID_N = 32, 26
+    def build(p, b, depth):
+        node = {"name": os.path.basename(p) or hostp(p), "path": hostp(p), "bytes": b}
+        kids = sorted(by_parent.get(p, []), key=lambda x: -x[1])
+        if kids and depth < 2:
+            shown = kids[:KID_N]
+            cnodes = [build(cp, cb, depth + 1) for cp, cb in shown]
+            rest = b - sum(cb for _, cb in shown)
+            if rest > max(10 * 1024 * 1024, int(b * 0.02)):
+                cnodes.append({"name": "(other)", "path": None, "bytes": rest})
+            node["children"] = cnodes
+        return node
+    tops = sorted(by_parent.get(root, []), key=lambda x: -x[1])[:TOP_N]
+    return total, [build(p, b, 1) for p, b in tops]
+
+def _disk_scan_store(key, **fields):
+    with _DISK_SCAN_LOCK:
+        _DISK_SCAN[key] = {"at": int(time.time()), **fields}
 
 def _safe_host_dir(path):
     """Map a requested absolute HOST path to its location under HOST_ROOT, only
@@ -5789,63 +7084,89 @@ def _safe_host_dir(path):
     real = (base + norm) if base else norm
     return real if os.path.isdir(real) else None
 
-def _disk_scan_worker(path, real):
+def _disk_scan_worker(path, real, key=None):
+    key = key or _disk_scan_key("local", path)
     base = HOST_ROOT.rstrip("/") if os.path.isdir(HOST_ROOT) else ""
     def hostp(p):
         return (p[len(base):] or "/") if base and p.startswith(base) else p
     try:
-        # --max-depth=2 gives two levels at once (folder + its sub-folders) for a
-        # nested treemap. du recurses fully regardless of --max-depth, so this is
-        # no costlier than depth 1 — it only prints more.
         # `--` ends option parsing so a path can never be read as a du flag.
         # `real` always starts with "/" already, so this is belt-and-suspenders.
-        r = subprocess.run(["du", "-b", "--max-depth=2", "--one-file-system", "--", real],
-                           capture_output=True, text=True, timeout=600)
-        sizes = {}
-        for ln in (r.stdout or "").splitlines():
-            parts = ln.split("\t", 1)
-            if len(parts) != 2:
-                continue
-            try:
-                sizes[os.path.normpath(parts[1])] = int(parts[0])
-            except ValueError:
-                continue
-        root = os.path.normpath(real)
-        total = sizes.get(root, 0)
-        by_parent = {}
-        for p, b in sizes.items():
-            if p == root:
-                continue
-            by_parent.setdefault(os.path.dirname(p), []).append((p, b))
-        TOP_N, KID_N = 32, 26
-        def build(p, b, depth):
-            node = {"name": os.path.basename(p) or hostp(p), "path": hostp(p), "bytes": b}
-            kids = sorted(by_parent.get(p, []), key=lambda x: -x[1])
-            if kids and depth < 2:
-                shown = kids[:KID_N]
-                cnodes = [build(cp, cb, depth + 1) for cp, cb in shown]
-                rest = b - sum(cb for _, cb in shown)
-                if rest > max(10 * 1024 * 1024, int(b * 0.02)):
-                    cnodes.append({"name": "(other)", "path": None, "bytes": rest})
-                node["children"] = cnodes
-            return node
-        tops = sorted(by_parent.get(root, []), key=lambda x: -x[1])[:TOP_N]
-        entries = [build(p, b, 1) for p, b in tops]
+        r = subprocess.run(["du", *_DU_ARGS, "--", real],
+                           capture_output=True, text=True, timeout=_DISK_SCAN_TIMEOUT)
+        total, entries = _parse_du(r.stdout, real, hostp)
         free = None
         try:
             s = os.statvfs(real); free = s.f_bavail * s.f_frsize
-        except Exception:
-            pass
-        with _DISK_SCAN_LOCK:
-            _DISK_SCAN[path] = {"state": "done", "at": int(time.time()),
-                                "total": total, "entries": entries, "free": free, "error": None}
+        except OSError as e:
+            print(f"disk scan statvfs({real}) failed: {e}", flush=True)
+        _disk_scan_store(key, state="done", total=total, entries=entries,
+                         free=free, error=None)
     except subprocess.TimeoutExpired:
-        with _DISK_SCAN_LOCK:
-            _DISK_SCAN[path] = {"state": "error", "at": int(time.time()),
-                                "error": "scan timed out — folder too large"}
+        _disk_scan_store(key, state="error", error="scan timed out — folder too large")
     except Exception as e:
-        with _DISK_SCAN_LOCK:
-            _DISK_SCAN[path] = {"state": "error", "at": int(time.time()), "error": str(e)[:200]}
+        _disk_scan_store(key, state="error", error=str(e)[:200])
+
+
+# Remotes are scanned the same way the rest of this project reads them: one ssh
+# call, no agent, nothing installed or left behind. `du` and `df` are in coreutils
+# on every Linux box the probe already supports.
+def _remote_scan_cmd(path):
+    q = shlex.quote(path)
+    # One round trip for both answers, with a sentinel between them so a `df`
+    # that fails can't be misread as du output (or vice versa).
+    return (f"du {' '.join(_DU_ARGS)} -- {q} 2>/dev/null; "
+            f"echo '---HLM-DF---'; "
+            f"df -P -B1 -- {q} 2>/dev/null | tail -1")
+
+def _parse_remote_free(block):
+    """Available bytes out of a `df -P -B1` line. POSIX -P guarantees one line
+    per filesystem with Available in the 4th column, which is what stops a long
+    device name from wrapping and shifting every field."""
+    for ln in (block or "").splitlines():
+        cols = ln.split()
+        if len(cols) >= 4:
+            try:
+                return int(cols[3])
+            except ValueError:
+                continue
+    return None
+
+def _disk_scan_worker_remote(key, name, path):
+    """Scan `path` on a registered remote over the existing SSH channel."""
+    try:
+        h = next((x for x in list_hosts() if x["name"] == name), None)
+        if not h:
+            _disk_scan_store(key, state="error", error=f"unknown host: {name}")
+            return
+        parsed = _parse_ssh_target(h.get("ssh_target"))
+        if not parsed:
+            _disk_scan_store(key, state="error", error="host has no usable SSH target")
+            return
+        u, host, port = parsed
+        rc, out, err, _ms = _ssh(u, host, port, _remote_scan_cmd(path),
+                                 timeout=_DISK_SCAN_TIMEOUT)
+        if rc != 0 and not out:
+            # du exits non-zero on any unreadable subdirectory, so a non-zero rc
+            # with output is a partial scan worth showing — only an empty one is
+            # a real failure.
+            _disk_scan_store(key, state="error",
+                             error=(err or f"ssh exited {rc}")[:200])
+            return
+        du_block, _, df_block = (out or "").partition("---HLM-DF---")
+        total, entries = _parse_du(du_block, path)
+        if not entries and not total:
+            # An empty result is ambiguous — an unreadable directory and an empty
+            # one look identical here — so say so rather than drawing a blank
+            # treemap that looks like a finished scan of nothing.
+            _disk_scan_store(key, state="error",
+                             error=f"no readable directories under {path} "
+                                   f"(the SSH user may not have permission)")
+            return
+        _disk_scan_store(key, state="done", total=total, entries=entries,
+                         free=_parse_remote_free(df_block), error=None)
+    except Exception as e:
+        _disk_scan_store(key, state="error", error=str(e)[:200])
 
 
 _BRIEF_PALETTE = {
@@ -6252,14 +7573,29 @@ def _brief_run_once(now=None):
 # Phase 3.2: moved to backend/collectors/ — re-exported for backward compat
 from backend.collectors import brief_worker
 from backend.collectors import watchdog as _collector_watchdog
+from backend.collectors import fast_sampler, fast_sample_once
+
+# ── App icons (selfh.st), cached on the hub ───────────────────────────────────
+# The store lives next to the history DB, so the icons the hub has fetched ride
+# the same ./data volume and survive a rebuild. The catalogue loads from that
+# cache at boot (so a box with no internet still has yesterday's icons) and is
+# refreshed on a background thread, weekly, only when the feature is on.
+import backend.icons as _icons
+ICON_STORE = _icons.IconStore(
+    os.path.join(os.path.dirname(DB_PATH) or ".", "icons"),
+    enabled=lambda: get_settings().get("icon_pack", "1") == "1")
+ICON_STORE.load_cached_index()
+
 
 
 if "pytest" not in sys.modules:
     threading.Thread(target=collector, daemon=True).start()
+    threading.Thread(target=fast_sampler, daemon=True).start()
     threading.Thread(target=host_poller, daemon=True).start()
     threading.Thread(target=uptime_worker, daemon=True).start()
     threading.Thread(target=brief_worker, daemon=True).start()
     threading.Thread(target=_collector_watchdog, daemon=True).start()
+    ICON_STORE.refresh_index_async()
 
 
 import os as _os
@@ -6325,7 +7661,8 @@ def _public_monitors(now):
 def _public_monitors_summary(monitors):
     return {"total": len(monitors),
             "up": sum(1 for m in monitors if m["state"] == "up"),
-            "down": sum(1 for m in monitors if m["state"] == "down")}
+            "down": sum(1 for m in monitors if m["state"] == "down"),
+            "maintenance": sum(1 for m in monitors if m.get("in_maintenance"))}
 
 def _public_incident_feed(monitors, now, days=14, cap=25):
     """Recent incidents across all public components, tagged with the service
@@ -6410,9 +7747,11 @@ def _public_status_detail(cid, now):
     with LOCK:
         rows90 = _uptime_repo.results_since_full(check["id"], now - 7776000, conn=DB)  # 90 days
     rows24 = [r for r in rows90 if r[0] >= now - 86400]
+    in_maint = _in_maintenance("uptime", check["id"]) or _in_maintenance("uptime", check.get("label", ""))
     return {
         "id": check["id"], "label": check["label"], "type": check["type"],
         "host": _public_monitor_host(check),
+        "in_maintenance": in_maint,
         "state": s["state"], "last_latency_ms": s["last_latency_ms"],
         "last_checked": s["last_checked"], "interval_sec": check["interval_sec"],
         "up_since": _uptime_up_since(rows90),
@@ -6430,16 +7769,19 @@ def _public_status_detail(cid, now):
     }
 
 def _public_overall_status(cards, monitors):
-    """ok only when every overview card is ok and no public monitor is down;
-    crit if a monitor is down; maintenance if nothing is down but something
-    is covered by an active maintenance window; warn otherwise."""
-    if any(m["state"] == "down" for m in monitors):
+    """ok when no public monitor is down and no overview card reports a real
+    problem; crit if a monitor is down and not covered by maintenance; warn if
+    a card reports warn/crit — "info" (subsystem unavailable) doesn't count as
+    a problem, and a real card-level problem is never masked by an unrelated
+    maintenance window; maintenance if nothing above applies but something is
+    in an active maintenance window."""
+    if any(m["state"] == "down" and not m.get("in_maintenance") for m in monitors):
         return "crit"
-    if all(c.get("status") == "ok" for c in cards):
-        if any(m.get("in_maintenance") for m in monitors):
-            return "maintenance"
-        return "ok"
-    return "warn"
+    if any(c.get("status") in ("warn", "crit") for c in cards):
+        return "warn"
+    if any(m.get("in_maintenance") for m in monitors):
+        return "maintenance"
+    return "ok"
 
 def _public_status_enabled():
     """On if either the PUBLIC_STATUS env var or the Settings toggle is set --

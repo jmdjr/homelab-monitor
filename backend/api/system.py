@@ -3,6 +3,7 @@ from flask import Blueprint, request, jsonify, Response, send_file, send_from_di
 import time
 import os
 import re
+import json
 import shutil
 import tempfile
 import threading
@@ -10,6 +11,74 @@ import threading
 from backend.db.repos import system as system_repo
 
 bp = Blueprint('system', __name__)
+
+# Flask's threaded server gives every open stream its own thread. That is fine for
+# the handful of dashboards a home lab has open, but the count must be bounded —
+# a browser stuck in a reconnect loop would otherwise keep allocating threads.
+_STREAM_MAX = 24
+_stream_n, _stream_lock = 0, threading.Lock()
+
+
+@bp.route("/api/now")
+def api_now():
+    """Live values only — no history, no database, no LOCK.
+
+    The polling counterpart of /api/stream, and the reason a fast refresh doesn't
+    cost anything: /api/data re-runs ~15 bucketed aggregates and re-ships the whole
+    charted series, which is wasted work when all that changed is a utilisation
+    number. Clients that can't hold a stream open poll this instead."""
+    import app as _app
+    return jsonify(_app.live_payload())
+
+
+@bp.route("/api/stream")
+def api_stream():
+    """Server-sent events: one `now` frame whenever the live values change, one
+    `fleet` frame whenever a remote host's poll lands.
+
+    Cheaper than the poll it replaces. An idle stream is a thread blocked on a
+    condition variable — no timers, no queries — and the browser stops paying for
+    a request every 15 seconds whether or not anything moved."""
+    import app as _app
+    global _stream_n
+    with _stream_lock:
+        if _stream_n >= _STREAM_MAX:
+            return jsonify({"error": "too many open streams"}), 503
+        _stream_n += 1
+
+    def gen():
+        global _stream_n
+        last_live = last_fleet = -1
+        try:
+            # Retry hint for the browser's own reconnect logic, then an immediate
+            # first frame so a fresh page paints from the stream instead of
+            # waiting out a whole interval for the next sample.
+            yield "retry: 3000\n\n"
+            while True:
+                with _app.LIVE_COND:
+                    if _app.LIVE_REV == last_live and _app.FLEET_REV == last_fleet:
+                        # Bounded wait so the loop still emits a keepalive through
+                        # proxies that time out idle connections.
+                        _app.LIVE_COND.wait(timeout=20)
+                    live, fleet = _app.LIVE_REV, _app.FLEET_REV
+                if live == last_live and fleet == last_fleet:
+                    yield ": ping\n\n"
+                    continue
+                if live != last_live:
+                    last_live = live
+                    yield "event: now\ndata: " + json.dumps(_app.live_payload()) + "\n\n"
+                if fleet != last_fleet:
+                    last_fleet = fleet
+                    yield "event: fleet\ndata: " + json.dumps(_app.fleet_payload()) + "\n\n"
+        except GeneratorExit:
+            raise
+        finally:
+            with _stream_lock:
+                _stream_n -= 1
+
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 
 @bp.route("/api/data")
@@ -51,8 +120,23 @@ def api_data():
         summary = sorted(({"service": s, "peak": round(pk), "avg": round(av), "present": round(100 * cnt / ticks)}
                           for s, pk, av, cnt in system_repo.query_proc_summary(since, conn=_app.DB)),
                          key=lambda x: -x["peak"])
-        model_summary = sorted(({"service": s, "model": m, "peak": round(pk or 0), "avg": round(av or 0)}
-                                for s, m, pk, av in system_repo.query_model_summary(since, conn=_app.DB)),
+        # Load sessions ("runs") + RAM-spill split + per-model caller attribution —
+        # all additive fields on the same model_summary rows the tab already draws.
+        _run_gap = max(3 * _app.INTERVAL, 90)
+        runs_by = {(s, m): (n or 0, sp or 0)
+                   for s, m, n, sp, _pr in system_repo.query_model_runs(since, _run_gap, conn=_app.DB)}
+        used_by = {}
+        for s, m, caller, n in system_repo.query_model_callers(since, conn=_app.DB):
+            used_by.setdefault((s, m), []).append(
+                {"caller": caller, "seconds": int((n or 0) * _app.INTERVAL)})
+        for v in used_by.values():
+            v.sort(key=lambda x: -x["seconds"])
+        model_summary = sorted(({"service": s, "model": m, "peak": round(pk or 0), "avg": round(av or 0),
+                                 "peak_ram": round(pram or 0),
+                                 "runs": runs_by.get((s, m), (0, 0))[0],
+                                 "runs_spilled": runs_by.get((s, m), (0, 0))[1],
+                                 "used_by": used_by.get((s, m), [])[:4]}
+                                for s, m, pk, av, pram in system_repo.query_model_summary(since, conn=_app.DB)),
                                key=lambda x: -x["peak"])
         callers = sorted(({"caller": c, "server": s, "seconds": int((tot or 0) * _app.INTERVAL), "samples": n}
                           for c, s, tot, n in system_repo.query_edges_summary(since, conn=_app.DB)),
@@ -68,6 +152,26 @@ def api_data():
         mem_total = _app.LATEST["mem_total"] or 24576
         peak = max(total["mempk"]) if total["mempk"] else 0
         insights = _app.build_insights(total, services, mem_total, oom_evs, _app.LATEST["host"])
+        # A loaded model that spills into system RAM runs its overflow layers on the
+        # CPU — the single biggest silent tokens/sec killer, so surface it live.
+        for m in (_app.LATEST.get("models") or []):
+            if (m.get("ram") or 0) > 0:
+                detail = (f"{round(m['ram'])} MB of {m['service']}'s {m['model']} sits in "
+                          f"system RAM next to {round(m.get('vram') or 0)} MB in VRAM — "
+                          "layers offloaded to the CPU slow generation down.")
+                # When we know the weights size, say WHY it spilled: weights vs the
+                # context/KV share of the residency (ctx_now = the num_ctx loaded).
+                w = ((_app.LATEST.get("model_meta") or {}).get(m["model"]) or {}).get("weights_mb")
+                # NB: not `total` — that name holds this response's time-series dict.
+                resident = (m.get("vram") or 0) + m["ram"]
+                if w and resident > w:
+                    ctx = m.get("ctx_now")
+                    detail += (f" The residency is ~{round(w)} MB weights + ~{round(resident - w)} MB "
+                               f"context/KV & buffers{f' (running at {ctx:,} ctx)' if ctx else ''} — "
+                               "a smaller context window would shrink the KV cache and may fit VRAM.")
+                insights.append({"level": "warning",
+                                 "title": f"{m['model']} is spilling into system RAM",
+                                 "detail": detail})
         diskio_evs = [e for e in evs if e["kind"] == "diskio_spike"]
         if diskio_evs:
             latest_by_dev = {}
@@ -88,7 +192,7 @@ def api_data():
                     "services": services, "other": other, "summary": summary, "model_summary": model_summary,
                     "callers": callers, "events": oom_evs, "insights": insights, "pressure_free_mb": _app.PRESSURE_MB,
                     "uptime_summary": up_summary, "disk_io": disk_io,
-                    "mem_total": mem_total, "peak_mem": peak, "now": _app.LATEST})
+                    "mem_total": mem_total, "peak_mem": peak, "now": _app.live_now()})
 
 
 @bp.route("/api/network")
@@ -252,7 +356,12 @@ def api_health():
                    "power": _app.LATEST["power"], "temp": _app.LATEST["temp"],
                    "available": bool(gpu_avail),
                    "gpus": _app.LATEST.get("gpus") or [],    # per-card detail (issue #95)
-                   "extra": _app.LATEST.get("gpu_extra") or {}},  # mem-bw/clocks/throttle (telemetry)
+                   "extra": _app.LATEST.get("gpu_extra") or {},  # mem-bw/clocks/throttle (telemetry)
+                   # None while the cards are there. When the hub HAD cards and
+                   # its nvidia-smi stopped answering, this carries the tool's
+                   # own error — and the UI must keep the GPU tab reachable so
+                   # the loss is visible, rather than hiding the tab as "no GPU".
+                   "telemetry": _app.gpu_telemetry("local", _app.LATEST)},
            "host": _app.enrich_os_upgrade(_app.LATEST["host"])}
     docker  = _app.HEALTH["docker"]  or {"available": False, "reason": "warming up…",
                                     "containers": [], "summary": {"total": 0, "running": 0, "problems": 0}}
@@ -303,7 +412,7 @@ def metrics():
 
     # Clear all multi-label gauges before re-populating so stale series vanish.
     for key in ("gpu_vram_used", "gpu_vram_total", "gpu_util", "gpu_temp", "gpu_power",
-                "host_disk_used", "model_vram", "container_state", "systemd_unit",
+                "host_disk_used", "model_vram", "model_ram", "container_state", "systemd_unit",
                 "models_installed"):
         _app._G[key].clear()
 
@@ -318,6 +427,10 @@ def metrics():
     # ── Host ─────────────────────────────────────────────────────────────────
     host = _app.LATEST.get("host") or {}
     _app._G["host_cpu"].set(host.get("cpu", 0))
+    if _app.LATEST.get("cpu_power") is not None:
+        _app._G["host_cpu_power"].set(_app.LATEST["cpu_power"])
+    if _app.LATEST.get("dram_power") is not None:
+        _app._G["host_dram_power"].set(_app.LATEST["dram_power"])
     ram_total = host.get("ram_total") or 1
     ram_used  = host.get("ram_used", 0)
     _app._G["host_mem_used"].set(round(100 * ram_used / ram_total, 1))
@@ -330,6 +443,9 @@ def metrics():
         if vram is not None:
             _app._G["model_vram"].labels(server=entry.get("service", "?"),
                                     model=entry.get("model", "?")).set(vram)
+            if entry.get("ram") is not None:
+                _app._G["model_ram"].labels(server=entry.get("service", "?"),
+                                       model=entry.get("model", "?")).set(entry["ram"])
 
     # ── Installed-models registry, by provider (#219) — no new I/O: counts the
     # already-sampled model_catalog, same source the /api/models endpoint merges.
@@ -367,23 +483,57 @@ def api_hub_pubkey():
 @bp.route("/api/disk_scan")
 def api_disk_scan():
     import app as _app
-    path = os.path.normpath(request.args.get("path") or "/")
+    """WizTree-style folder scan of `path`, on the hub or on any registered host.
+
+    `host` selects the machine: absent (or "local") reads the hub's own
+    filesystem through the read-only root mount; a registered name runs the same
+    `du` over the SSH channel the fleet is already polled on."""
+    path = _app._safe_scan_path(request.args.get("path") or "/")
+    if not path:
+        return jsonify({"path": request.args.get("path"), "state": "error",
+                        "error": "invalid path"})
+    host = (request.args.get("host") or "local").strip() or "local"
     rescan = request.args.get("rescan") == "1"
-    real = _app._safe_host_dir(path)
-    if not real:
-        return jsonify({"path": path, "state": "error", "error": f"not a readable directory: {path}"})
+    key = _app._disk_scan_key(host, path)
+    is_local = key[0] == "local"
+
+    real = None
+    if is_local:
+        real = _app._safe_host_dir(path)
+        if not real:
+            return jsonify({"path": path, "host": host, "state": "error",
+                            "error": f"not a readable directory: {path}"})
+    else:
+        # Fail here rather than after a 10-minute SSH attempt: an unregistered
+        # name, or a host the probe has never reached, can't be scanned.
+        h = next((x for x in _app.list_hosts() if x["name"] == host), None)
+        if not h:
+            return jsonify({"path": path, "host": host, "state": "error",
+                            "error": f"unknown host: {host}"})
+        fam = (((h.get("last_check") or {}).get("os") or {}).get("family") or "linux")
+        if fam == "windows":
+            return jsonify({"path": path, "host": host, "state": "error",
+                            "error": "Disk-content scanning isn't supported on Windows "
+                                     "hosts yet — it needs the POSIX du."})
+
     with _app._DISK_SCAN_LOCK:
-        ent = _app._DISK_SCAN.get(path)
+        ent = _app._DISK_SCAN.get(key)
         if ent and not rescan:
             if ent["state"] == "scanning":
-                return jsonify({"path": path, "state": "scanning"})
+                return jsonify({"path": path, "host": host, "state": "scanning"})
             if ent["state"] == "done" and time.time() - ent["at"] < _app._DISK_SCAN_TTL:
-                return jsonify({"path": path, **ent})
+                return jsonify({"path": path, "host": host, **ent})
             if ent["state"] == "error" and time.time() - ent["at"] < 20:
-                return jsonify({"path": path, **ent})
-        _app._DISK_SCAN[path] = {"state": "scanning", "at": int(time.time())}
-    threading.Thread(target=_app._disk_scan_worker, args=(path, real), daemon=True).start()
-    return jsonify({"path": path, "state": "scanning"})
+                return jsonify({"path": path, "host": host, **ent})
+        _app._DISK_SCAN[key] = {"state": "scanning", "at": int(time.time())}
+
+    if is_local:
+        threading.Thread(target=_app._disk_scan_worker, args=(path, real, key),
+                         daemon=True).start()
+    else:
+        threading.Thread(target=_app._disk_scan_worker_remote, args=(key, host, path),
+                         daemon=True).start()
+    return jsonify({"path": path, "host": host, "state": "scanning"})
 
 
 @bp.route("/api/backup")
@@ -478,12 +628,87 @@ def api_settings():
         # Secrets pass through the "_set: false" sentinel from the UI as a way
         # to clear without revealing the current value.
         updates = {k: body[k] for k in body if k in _app.SETTING_DEFAULTS}
+        # custom_ai_servers is stored as a JSON string. The UI sends the string;
+        # a direct API client may POST the list itself — normalize here, or
+        # save_settings would persist str(list) (a Python repr, not JSON) and
+        # the value would be unreadable on every later parse.
+        if "custom_ai_servers" in updates and not isinstance(updates["custom_ai_servers"], str):
+            updates["custom_ai_servers"] = json.dumps(updates["custom_ai_servers"])
         err = (_app._validate_url_settings(updates) or _app._validate_email_settings(updates)
-               or _app._validate_brief_settings(updates) or _app._validate_retention_settings(updates))
+               or _app._validate_brief_settings(updates) or _app._validate_retention_settings(updates)
+               or _app._validate_gpu_alert_settings(updates) or _app._validate_custom_ai_servers(updates)
+               or _app._validate_home_shortcuts(updates)
+               or _app._validate_fast_interval_settings(updates))
         if err:
             return jsonify({"ok": False, "error": err}), 400
         _app.save_settings(updates)
     return jsonify({"version": _app.VERSION, "settings": _app._public_settings()})
+
+
+@bp.route("/api/shortcuts", methods=["GET", "POST"])
+def api_shortcuts():
+    """The Overview launchpad's pinned apps. Its own endpoint rather than a
+    field on /api/settings: the Overview needs this list on every load, and
+    /api/settings is the whole (partly redacted) settings blob. POST replaces
+    the list wholesale — the launchpad edits a local copy and saves it, the
+    same shape the custom-AI-servers editor uses."""
+    import app as _app
+    if request.method == "POST":
+        body = request.get_json(silent=True)
+        raw = body.get("shortcuts") if isinstance(body, dict) else body
+        entries, err = _app.parse_shortcuts(raw if isinstance(raw, str) else json.dumps(raw or []))
+        if err:
+            return jsonify({"ok": False, "error": f"Home shortcuts: {err}."}), 400
+        _app.save_settings({"home_shortcuts": json.dumps(entries)})
+        return jsonify({"ok": True, "shortcuts": entries})
+    entries, err = _app.parse_shortcuts(_app.get_settings().get("home_shortcuts"))
+    if err:                      # a hand-edited DB value must not blank the tab
+        print(f"home_shortcuts ignored ({err})", flush=True)
+        entries = []
+    return jsonify({"shortcuts": entries})
+
+
+@bp.route("/api/settings/ai_servers/providers")
+def api_settings_ai_servers_providers():
+    import app as _app
+    """The PROBES provider keys, for the custom-AI-servers type dropdown. A
+    stable, ordered list: the curated common ones first, the rest alphabetical."""
+    keys = [key for key, _fn in _app.PROBES]
+    preferred = ["vllm", "ollama", "lmstudio", "lm-studio", "llama.cpp", "llama-server",
+                 "sglang", "localai", "local-ai", "xinference", "koboldcpp", "mistral-rs",
+                 "text-generation-inference"]
+    out = [k for k in preferred if k in keys]
+    out += sorted(k for k in keys if k not in out)
+    return jsonify({"providers": out})
+
+
+@bp.route("/api/settings/ai_servers/test", methods=["POST"])
+def api_settings_ai_servers_test():
+    import app as _app
+    """One-shot reachability test for a (not-yet-saved) custom AI server. The
+    browser can't be assumed to reach a private host:port — a server on the LAN
+    or tailnet the user is browsing from may be invisible to it — so the probe
+    runs from the hub. Always 200; `ok` is the signal, the model list is the
+    proof, and nothing but that leaks back out."""
+    from backend.probes import probe_custom_server
+    body = request.get_json(silent=True) or {}
+    desc = {"name": str(body.get("name") or "test")[:60],
+            "host": str(body.get("host") or "").strip(),
+            "port": body.get("port"),
+            "provider": str(body.get("provider") or "").strip()}
+    try:
+        desc["port"] = int(desc["port"])
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "models": [], "error": "Port must be a number."})
+    rows = probe_custom_server(desc)
+    if not rows:
+        return jsonify({"ok": False, "models": [],
+                        "error": f"No models answered from {desc['host']}:{desc['port']} "
+                                 f"({desc['provider']}). Check the host, port and provider."})
+    names = [r[0] for r in rows][:50]
+    loaded = sum(1 for r in rows if r[1] is not None)
+    return jsonify({"ok": True, "models": names, "loaded": loaded,
+                    "truncated": len(names) == 50 and len(rows) > 50})
 
 
 @bp.route("/api/update/app", methods=["POST"])
